@@ -4,7 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from musicbot.audio import DEFAULT_BITRATE_KBPS, DEFAULT_SOURCE, make_source
+from musicbot.audio import DEFAULT_BITRATE_KBPS, make_source
 
 log = logging.getLogger(__name__)
 
@@ -47,15 +47,11 @@ class Voice(commands.Cog):
         return channel
 
     @app_commands.command(name="ecaplay", description="Stream the audio bridge into a voice channel.")
-    @app_commands.describe(
-        channel="Voice channel to join (defaults to yours).",
-        source="PipeWire/Pulse source name (defaults to AUDIO_SOURCE env).",
-    )
+    @app_commands.describe(channel="Voice channel to join (defaults to yours).")
     async def ecaplay(
         self,
         interaction: discord.Interaction,
         channel: discord.VoiceChannel | None = None,
-        source: str | None = None,
     ):
         if interaction.guild is None:
             await interaction.response.send_message("Guild-only command.", ephemeral=True)
@@ -65,7 +61,7 @@ class Voice(commands.Cog):
         if target is None:
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
 
         vc: discord.VoiceClient | None = interaction.guild.voice_client  # type: ignore[assignment]
         if vc is None:
@@ -75,7 +71,7 @@ class Voice(commands.Cog):
         if vc.is_playing():
             vc.stop()
 
-        audio = make_source(source)
+        audio = make_source()
 
         def _after(err: Exception | None):
             if err:
@@ -89,8 +85,7 @@ class Voice(commands.Cog):
             log.warning("failed to configure opus encoder: %r", exc)
 
         await interaction.followup.send(
-            f"Streaming `{source or DEFAULT_SOURCE}` → {target.mention} @ {DEFAULT_BITRATE_KBPS} kbps.",
-            ephemeral=True,
+            f"Streaming → {target.mention} @ {DEFAULT_BITRATE_KBPS} kbps.",
         )
 
     @app_commands.command(name="ecaleave", description="Stop streaming and disconnect.")
@@ -103,7 +98,7 @@ class Voice(commands.Cog):
             await interaction.response.send_message("Not connected.", ephemeral=True)
             return
         await vc.disconnect(force=False)
-        await interaction.response.send_message("Disconnected.", ephemeral=True)
+        await interaction.response.send_message("Disconnected.")
 
 
 async def setup(bot: commands.Bot):
