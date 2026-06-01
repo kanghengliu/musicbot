@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from musicbot import routing
+from musicbot import presence, routing
 
 log = logging.getLogger("musicbot")
 
@@ -19,6 +19,7 @@ class MusicBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.guild_id = guild_id
         self._routing_task: asyncio.Task[None] | None = None
+        self._presence_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         await self.load_extension("musicbot.cogs.voice")
@@ -32,10 +33,12 @@ class MusicBot(commands.Bot):
             log.info("synced %d global commands (may take up to 1h to appear)", len(synced))
 
         self._routing_task = asyncio.create_task(routing.reconciler(), name="pw-route-reconciler")
+        self._presence_task = asyncio.create_task(presence.updater(self), name="presence-updater")
 
     async def close(self) -> None:
-        if self._routing_task is not None:
-            self._routing_task.cancel()
+        for task in (self._routing_task, self._presence_task):
+            if task is not None:
+                task.cancel()
         await super().close()
 
     async def on_ready(self):
