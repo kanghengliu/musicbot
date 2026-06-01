@@ -46,7 +46,7 @@ class Voice(commands.Cog):
             return None
         return channel
 
-    @app_commands.command(name="ecaplay", description="Stream the audio bridge into a voice channel.")
+    @app_commands.command(name="ecaplay", description="eca在听什么👀")
     @app_commands.describe(channel="Voice channel to join (defaults to yours).")
     async def ecaplay(
         self,
@@ -88,7 +88,7 @@ class Voice(commands.Cog):
             f"Streaming → {target.mention} @ {DEFAULT_BITRATE_KBPS} kbps.",
         )
 
-    @app_commands.command(name="ecaleave", description="Stop streaming and disconnect.")
+    @app_commands.command(name="ecaleave", description="不好听走了🚶")
     async def ecaleave(self, interaction: discord.Interaction):
         if interaction.guild is None:
             await interaction.response.send_message("Guild-only command.", ephemeral=True)
