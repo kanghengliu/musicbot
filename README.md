@@ -77,7 +77,7 @@ The source is fixed to `AUDIO_SOURCE` from `.env` (default `BotSink.monitor`) â€
 | Env var         | Purpose                                                                 |
 |-----------------|-------------------------------------------------------------------------|
 | `DISCORD_TOKEN` | Bot token from the developer portal. Required.                          |
-| `GUILD_ID`      | Single guild for instant slash-command sync. Leave blank for global.    |
+| `GUILD_IDS`     | Comma-separated guild IDs for instant slash-command sync. Leave blank for global (~1h). |
 | `AUDIO_SOURCE`  | PipeWire/Pulse source to read. Default: `BotSink.monitor`.              |
 | `OPUS_BITRATE`  | Opus encoder bitrate in kbps. Default: `256`. See note below.           |
 | `LOG_LEVEL`     | `DEBUG` / `INFO` / `WARNING`. Default: `INFO`.                          |
