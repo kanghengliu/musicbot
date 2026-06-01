@@ -67,10 +67,8 @@ You should see `synced N commands to guild ...` and `logged in as ...`.
 
 | Command                              | What it does                                                |
 |--------------------------------------|-------------------------------------------------------------|
-| `/play [channel] [source]`           | Join (your current voice channel by default) and stream.    |
-| `/stop`                              | Stop streaming, stay connected.                             |
-| `/join [channel]`                    | Join without playing.                                       |
-| `/leave`                             | Disconnect.                                                 |
+| `/ecaplay [channel] [source]`        | Join (your current voice channel by default) and stream. Restarts cleanly if already playing. |
+| `/ecaleave`                          | Stop streaming and disconnect.                              |
 
 `source` defaults to `AUDIO_SOURCE` in `.env` (e.g. `BotSink.monitor`). Pass any other PipeWire/Pulse source name to override per-call (`pactl list short sources` to enumerate).
 

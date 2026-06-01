@@ -46,12 +46,12 @@ class Voice(commands.Cog):
             return None
         return channel
 
-    @app_commands.command(name="play", description="Stream the audio bridge into a voice channel.")
+    @app_commands.command(name="ecaplay", description="Stream the audio bridge into a voice channel.")
     @app_commands.describe(
         channel="Voice channel to join (defaults to yours).",
         source="PipeWire/Pulse source name (defaults to AUDIO_SOURCE env).",
     )
-    async def play(
+    async def ecaplay(
         self,
         interaction: discord.Interaction,
         channel: discord.VoiceChannel | None = None,
@@ -65,17 +65,15 @@ class Voice(commands.Cog):
         if target is None:
             return
 
-        vc: discord.VoiceClient | None = interaction.guild.voice_client  # type: ignore[assignment]
-        if vc and vc.is_playing():
-            await interaction.response.send_message("Already playing — `/stop` first.", ephemeral=True)
-            return
-
         await interaction.response.defer(ephemeral=True, thinking=True)
 
+        vc: discord.VoiceClient | None = interaction.guild.voice_client  # type: ignore[assignment]
         if vc is None:
             vc = await target.connect()
         elif vc.channel != target:
             await vc.move_to(target)
+        if vc.is_playing():
+            vc.stop()
 
         audio = make_source(source)
 
@@ -84,8 +82,6 @@ class Voice(commands.Cog):
                 log.warning("playback ended with error: %r", err)
 
         vc.play(audio, after=_after)
-        # vc.encoder is created lazily by play(); set bitrate + disable FEC
-        # (FEC trades bitrate for packet-loss resilience — not worth it for music).
         try:
             vc.encoder.set_bitrate(DEFAULT_BITRATE_KBPS)
             vc.encoder.set_fec(False)
@@ -97,40 +93,8 @@ class Voice(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="stop", description="Stop streaming (stay connected).")
-    async def stop(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            await interaction.response.send_message("Guild-only command.", ephemeral=True)
-            return
-        vc: discord.VoiceClient | None = interaction.guild.voice_client  # type: ignore[assignment]
-        if vc and vc.is_playing():
-            vc.stop()
-            await interaction.response.send_message("Stopped.", ephemeral=True)
-        else:
-            await interaction.response.send_message("Not playing.", ephemeral=True)
-
-    @app_commands.command(name="join", description="Join a voice channel without playing.")
-    @app_commands.describe(channel="Voice channel to join (defaults to yours).")
-    async def join(
-        self,
-        interaction: discord.Interaction,
-        channel: discord.VoiceChannel | None = None,
-    ):
-        if interaction.guild is None:
-            await interaction.response.send_message("Guild-only command.", ephemeral=True)
-            return
-        target = await self._resolve_channel(interaction, channel)
-        if target is None:
-            return
-        vc: discord.VoiceClient | None = interaction.guild.voice_client  # type: ignore[assignment]
-        if vc is None:
-            await target.connect()
-        elif vc.channel != target:
-            await vc.move_to(target)
-        await interaction.response.send_message(f"Joined {target.mention}.", ephemeral=True)
-
-    @app_commands.command(name="leave", description="Disconnect from voice.")
-    async def leave(self, interaction: discord.Interaction):
+    @app_commands.command(name="ecaleave", description="Stop streaming and disconnect.")
+    async def ecaleave(self, interaction: discord.Interaction):
         if interaction.guild is None:
             await interaction.response.send_message("Guild-only command.", ephemeral=True)
             return
