@@ -12,6 +12,26 @@ log = logging.getLogger(__name__)
 class Voice(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # Per-guild flag: set before an intentional vc.stop()/disconnect so the
+        # after-callback knows not to auto-restart.
+        self._expect_stop: dict[int, bool] = {}
+
+    def _make_after(self, vc: discord.VoiceClient, gid: int):
+        def _after(err: Exception | None):
+            if self._expect_stop.pop(gid, False):
+                return
+            if err:
+                log.warning("playback ended with error: %r — auto-restarting", err)
+            else:
+                log.info("playback ended unexpectedly (clean EOF) — auto-restarting")
+            if not vc.is_connected():
+                return
+            try:
+                vc.play(make_source(), after=self._make_after(vc, gid))
+            except Exception as exc:
+                log.warning("auto-restart failed: %r", exc)
+
+        return _after
 
     async def _resolve_channel(
         self,
@@ -68,16 +88,12 @@ class Voice(commands.Cog):
             vc = await target.connect()
         elif vc.channel != target:
             await vc.move_to(target)
+        gid = interaction.guild.id
         if vc.is_playing():
+            self._expect_stop[gid] = True
             vc.stop()
 
-        audio = make_source()
-
-        def _after(err: Exception | None):
-            if err:
-                log.warning("playback ended with error: %r", err)
-
-        vc.play(audio, after=_after)
+        vc.play(make_source(), after=self._make_after(vc, gid))
         try:
             vc.encoder.set_bitrate(DEFAULT_BITRATE_KBPS)
             vc.encoder.set_fec(False)
@@ -97,6 +113,7 @@ class Voice(commands.Cog):
         if vc is None:
             await interaction.response.send_message("Not connected.", ephemeral=True)
             return
+        self._expect_stop[interaction.guild.id] = True
         await vc.disconnect(force=False)
         await interaction.response.send_message("Disconnected.")
 
