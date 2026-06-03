@@ -9,10 +9,13 @@ import discord
 
 log = logging.getLogger(__name__)
 
-# Empty = pick the first available MPRIS player. Set to a specific player name
-# (substring match) to pin to one — useful when multiple players are active.
+# Empty = pick whichever player is currently Playing. Set to a substring that
+# matches either the MPRIS bus-name (e.g. "kdeconnect") OR the MPRIS Identity
+# property (e.g. "WayDroid", "Apple Music"). Identity is set by the source app
+# itself and survives KDE Connect hash rolls, so it's the more stable filter.
 PLAYER_FILTER = os.environ.get("MPRIS_PLAYER", "").strip()
 POLL_INTERVAL = float(os.environ.get("PRESENCE_POLL_SECONDS", "3"))
+_STATUS_RANK = {"playing": 0, "paused": 1, "stopped": 2}
 
 
 @dataclass(frozen=True)
@@ -35,41 +38,70 @@ def _list_players() -> list[str]:
     return [p for p in res.stdout.splitlines() if p.strip()]
 
 
+def _read_identity(player: str) -> str:
+    """MPRIS root Identity property (e.g. 'Apple Music - WayDroid'). '' on failure."""
+    res = subprocess.run(
+        [
+            "busctl", "--user", "--no-pager", "get-property",
+            f"org.mpris.MediaPlayer2.{player}",
+            "/org/mpris/MediaPlayer2",
+            "org.mpris.MediaPlayer2", "Identity",
+        ],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return ""
+    # busctl format for a string: 's "the value"'
+    line = res.stdout.strip()
+    if line.startswith("s "):
+        return line[2:].strip().strip('"')
+    return ""
+
+
+def _player_metadata(player: str) -> tuple[str, str, str] | None:
+    """Return (status, title, artist) for a player, or None if no metadata."""
+    res = subprocess.run(
+        [
+            "playerctl", f"--player={player}", "metadata",
+            "--format", "{{status}}|{{title}}|{{artist}}",
+        ],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    parts = res.stdout.strip().split("|", 2)
+    while len(parts) < 3:
+        parts.append("")
+    status, title, artist = (p.strip() for p in parts)
+    if not title:
+        return None
+    return status, title, artist
+
+
 def _read_metadata() -> Track | None:
     if not shutil.which("playerctl"):
         return None
 
-    players = _list_players()
+    candidates = _list_players()
     if PLAYER_FILTER:
-        players = [p for p in players if PLAYER_FILTER in p]
-    if not players:
+        # Match against bus-name or Identity — Identity is more stable.
+        candidates = [p for p in candidates if PLAYER_FILTER in p or PLAYER_FILTER in _read_identity(p)]
+    if not candidates:
         return None
 
-    for player in players:
-        res = subprocess.run(
-            [
-                "playerctl",
-                f"--player={player}",
-                "metadata",
-                "--format",
-                "{{status}}|{{title}}|{{artist}}",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if res.returncode != 0:
+    tracks: list[Track] = []
+    for player in candidates:
+        meta = _player_metadata(player)
+        if meta is None:
             continue
-        line = res.stdout.strip()
-        if not line:
-            continue
-        parts = line.split("|", 2)
-        while len(parts) < 3:
-            parts.append("")
-        status, title, artist = parts
-        if not title.strip():
-            continue
-        return Track(status=status.strip(), title=title.strip(), artist=artist.strip())
-    return None
+        status, title, artist = meta
+        tracks.append(Track(status=status, title=title, artist=artist))
+
+    if not tracks:
+        return None
+    # Prefer Playing > Paused > Stopped; within a rank, take the first.
+    tracks.sort(key=lambda t: _STATUS_RANK.get(t.status.lower(), 99))
+    return tracks[0]
 
 
 def _to_activity(track: Track | None) -> discord.Activity | None:
