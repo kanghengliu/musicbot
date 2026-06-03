@@ -5,7 +5,6 @@ import signal
 
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
 
 from musicbot import presence, routing
 
@@ -51,7 +50,6 @@ class MusicBot(commands.Bot):
 
 
 async def _amain() -> None:
-    load_dotenv()
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise SystemExit("DISCORD_TOKEN missing — copy .env.example to .env and fill it in.")
