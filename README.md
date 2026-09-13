@@ -94,23 +94,21 @@ The source is fixed to `AUDIO_SOURCE` from `.env` (default `BotSink.monitor`) �
 | `DISCORD_TOKEN` | Bot token from the developer portal. Required.                          |
 | `GUILD_IDS`     | Comma-separated guild IDs for instant slash-command sync. Leave blank for global (~1h). |
 | `AUDIO_SOURCE`  | PipeWire/Pulse source to read. Default: `BotSink.monitor`.              |
-| `OPUS_BITRATE`  | Opus encoder bitrate in kbps. Default: `256`. See note below.           |
+| `OPUS_BITRATE`  | Optional opus bitrate cap in kbps. Default: the server's boost-tier max. See note below. |
 | `LOG_LEVEL`     | `DEBUG` / `INFO` / `WARNING`. Default: `INFO`.                          |
 
 ### Bitrate
 
-The bot sets the opus encoder bitrate from `OPUS_BITRATE` (kbps) and disables FEC (which trades bandwidth for packet-loss resilience — pointless for a music stream).
+The bot sets the opus encoder bitrate to each server's boost-tier maximum and disables FEC (which trades bandwidth for packet-loss resilience — pointless for a music stream). Set `OPUS_BITRATE` to cap it lower across all servers.
 
-Discord caps **per voice channel** based on boost tier:
+| Boost tier     | Channel cap |
+|----------------|-------------|
+| None           | 96 kbps     |
+| Tier 1         | 128 kbps    |
+| Tier 2         | 256 kbps    |
+| Tier 3 / VIP   | 384 kbps    |
 
-| Boost tier | Channel cap |
-|------------|-------------|
-| None       | 96 kbps     |
-| Tier 1     | 128 kbps    |
-| Tier 2     | 256 kbps    |
-| Tier 3     | 384 kbps    |
-
-You also need to actually crank the **channel** bitrate to match in Discord: right-click the voice channel → Edit Channel → Audio Bitrate. The wire bitrate is `min(channel_bitrate, OPUS_BITRATE)` — if the channel is left at the 64 kbps default, that's what you'll hear regardless of `OPUS_BITRATE`.
+You also need to actually crank the **channel** bitrate to match in Discord: right-click the voice channel → Edit Channel → Audio Bitrate. The wire bitrate is `min(channel_bitrate, encoder_bitrate)` — if the channel is left at the 64 kbps default, that's what you'll hear regardless of the server's tier.
 
 ## Troubleshooting
 

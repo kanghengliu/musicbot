@@ -4,7 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from musicbot.audio import DEFAULT_BITRATE_KBPS, make_source
+from musicbot.audio import bitrate_for, make_source
 
 log = logging.getLogger(__name__)
 
@@ -15,6 +15,13 @@ class Voice(commands.Cog):
         # Per-guild flag: set before an intentional vc.stop()/disconnect so the
         # after-callback knows not to auto-restart.
         self._expect_stop: dict[int, bool] = {}
+
+    def _play(self, vc: discord.VoiceClient, gid: int) -> int:
+        # play() builds a fresh encoder each call, so bitrate/FEC must be passed
+        # here rather than set afterwards — otherwise restarts revert to 128/FEC.
+        kbps = bitrate_for(vc.guild)
+        vc.play(make_source(), after=self._make_after(vc, gid), bitrate=kbps, fec=False)
+        return kbps
 
     def _make_after(self, vc: discord.VoiceClient, gid: int):
         def _after(err: Exception | None):
@@ -27,7 +34,7 @@ class Voice(commands.Cog):
             if not vc.is_connected():
                 return
             try:
-                vc.play(make_source(), after=self._make_after(vc, gid))
+                self._play(vc, gid)
             except Exception as exc:
                 log.warning("auto-restart failed: %r", exc)
 
@@ -93,15 +100,10 @@ class Voice(commands.Cog):
             self._expect_stop[gid] = True
             vc.stop()
 
-        vc.play(make_source(), after=self._make_after(vc, gid))
-        try:
-            vc.encoder.set_bitrate(DEFAULT_BITRATE_KBPS)
-            vc.encoder.set_fec(False)
-        except Exception as exc:
-            log.warning("failed to configure opus encoder: %r", exc)
+        kbps = self._play(vc, gid)
 
         await interaction.followup.send(
-            f"Streaming → {target.mention} @ {DEFAULT_BITRATE_KBPS} kbps.",
+            f"Streaming → {target.mention} @ {kbps} kbps.",
         )
 
     @app_commands.command(name="ecaleave", description="不好听走了🚶")
