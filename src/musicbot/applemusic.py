@@ -248,14 +248,16 @@ async def toggle_pause() -> ControlResult:
     return await _control("playpause")
 
 
-# Apple Music's PlaybackQueueInsertionType values.
-_INSERT_AT_END = 2
-_INSERT_AFTER_CURRENT = 3
+# Apple Music's PlaybackQueueInsertionType AFTER_CURRENT_ITEM. For the end of the
+# section MediaCtl picks the type itself ("end"): AT_END_OF_QUEUE_SECTION (10) is
+# ignored while Playing Next is empty. Never AT_END (2) — that appends after Autoplay.
+_INSERT_AFTER_CURRENT = "3"
 
 
 async def enqueue(song_id: str, *, next_up: bool) -> ControlResult:
-    """Insert into Apple Music's own queue — right after the current song, or at the end."""
-    return await _control("enqueue", str(_INSERT_AFTER_CURRENT if next_up else _INSERT_AT_END), song_id)
+    """Add to the user's "Playing Next" section — at its front, or at its end (before
+    the rest of the album/playlist and Autoplay)."""
+    return await _control("enqueue", _INSERT_AFTER_CURRENT if next_up else "end", song_id)
 
 
 async def upcoming() -> ControlResult:

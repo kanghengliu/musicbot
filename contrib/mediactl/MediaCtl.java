@@ -22,7 +22,7 @@ import java.util.List;
  *
  * Run: CLASSPATH=/data/local/tmp/musicbot-mediactl.dex app_process / MediaCtl <cmd> [args]
  *   now | list | queue | mediaid <storeId> | search <query> | uri <uri>
- *   next | previous | playpause | enqueue <insertionType> <storeId>... | remove <itemQueueId>
+ *   next | previous | playpause | enqueue <insertionType|end> <storeId>... | remove <itemQueueId>
  *
  * Output is tab-separated for the bot to parse:
  *   BEFORE  state artist title   (always)
@@ -37,10 +37,14 @@ public class MediaCtl {
 
     // Apple Music's own custom session command (handled in its media3 callback's
     // onCustomCommand → MediaPlayerController.addQueueItems). Insertion types are
-    // PlaybackQueueInsertionType: 2 = AT_END, 3 = AFTER_CURRENT_ITEM.
+    // PlaybackQueueInsertionType: 3 = AFTER_CURRENT_ITEM, 10 = AT_END_OF_QUEUE_SECTION
+    // (2 = AT_END appends after Autoplay).
     static final String ADD_QUEUE_ITEMS = "com.apple.android.music.playback.command.ADD_QUEUE_ITEMS";
     static final String ARG_PROVIDER = "com.apple.android.music.playback.command.ARGUMENT_PLAYBACK_QUEUE_ITEM_PROVIDER";
     static final String ARG_INSERTION_TYPE = "com.apple.android.music.playback.command.ARGUMENT_PLAYBACK_QUEUE_INSERTION_TYPE";
+    static final int INSERT_AFTER_CURRENT_ITEM = 3;
+    static final int INSERT_AT_END_OF_QUEUE_SECTION = 10;
+    static final String EXTRA_CAN_ADD_TO_QUEUE_SECTION = "com.apple.android.music.playback.playbackstate.EXTRA_CAN_ADD_TO_QUEUE_SECTION";
     static final String REMOVE_QUEUE_ITEM = "com.apple.android.music.playback.command.REMOVE_QUEUE_ITEM";
     static final String ARG_QUEUE_ID = "com.apple.android.music.playback.command.ARGUMENT_PLAYBACK_QUEUE_ID";
 
@@ -111,6 +115,19 @@ public class MediaCtl {
         return sb.toString();
     }
 
+    /**
+     * "end" = end of the user's Playing Next section. The app ignores
+     * AT_END_OF_QUEUE_SECTION while that section is empty (it reports
+     * EXTRA_CAN_ADD_TO_QUEUE_SECTION=false), and then "after the current song"
+     * is the same spot. Anything else is a literal insertion type.
+     */
+    static int insertionType(MediaController c, String arg) {
+        if (!arg.equals("end")) return Integer.parseInt(arg);
+        Bundle ex = c.getExtras();
+        boolean canAddToSection = ex != null && ex.getBoolean(EXTRA_CAN_ADD_TO_QUEUE_SECTION);
+        return canAddToSection ? INSERT_AT_END_OF_QUEUE_SECTION : INSERT_AFTER_CURRENT_ITEM;
+    }
+
     static void print(String tag, MediaController c) {
         System.out.println(tag + "\t" + stateName(c) + "\t" + track(c));
     }
@@ -169,7 +186,7 @@ public class MediaCtl {
                 String[] ids = Arrays.copyOfRange(args, 2, args.length);
                 Bundle b = new Bundle();
                 b.putParcelable(ARG_PROVIDER, new StorePlaybackQueueItemProvider(ids));
-                b.putInt(ARG_INSERTION_TYPE, Integer.parseInt(arg));
+                b.putInt(ARG_INSERTION_TYPE, insertionType(c, arg));
                 c.sendCommand(ADD_QUEUE_ITEMS, b, null);
                 wait = Wait.QUEUE;
                 break;
