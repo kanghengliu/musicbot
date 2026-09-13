@@ -101,7 +101,7 @@ class SongActions(OwnerView):
         await self._run(interaction, False)
 
     async def _run(self, interaction: discord.Interaction, next_up: bool | None):
-        """next_up: None = play now, True = after the current song, False = end of the queue."""
+        """next_up: None = play now (keeps Playing Next), True = front of Playing Next, False = its end."""
         song = self.song
         await interaction.response.edit_message(content=f"Sending **{_song(song)}** to Apple Music…", view=None)
         try:

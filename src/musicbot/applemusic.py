@@ -236,8 +236,14 @@ async def _control(*args: str) -> ControlResult:
     return await asyncio.to_thread(_mediactl, *args)
 
 
+# PlaybackQueueInsertionType KEEP_AND_REPLACE: start the song but keep the user's
+# Playing Next section. A plain playFromMediaId is REPLACE, which makes the app pop
+# a "keep or clear your queued songs?" dialog on its screen when that section isn't empty.
+_KEEP_AND_REPLACE = "6"
+
+
 async def play_song(song_id: str) -> ControlResult:
-    return await _control("mediaid", song_id)
+    return await _control("play", _KEEP_AND_REPLACE, song_id)
 
 
 async def skip() -> ControlResult:

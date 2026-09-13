@@ -23,6 +23,7 @@ import java.util.List;
  * Run: CLASSPATH=/data/local/tmp/musicbot-mediactl.dex app_process / MediaCtl <cmd> [args]
  *   now | list | queue | mediaid <storeId> | search <query> | uri <uri>
  *   next | previous | playpause | enqueue <insertionType|end> <storeId>... | remove <itemQueueId>
+ *   play <insertionType> <storeId>...   (PLAY_PROVIDER; 6 = keep Playing Next, 5 = clear it)
  *
  * Output is tab-separated for the bot to parse:
  *   BEFORE  state artist title   (always)
@@ -45,6 +46,9 @@ public class MediaCtl {
     static final int INSERT_AFTER_CURRENT_ITEM = 3;
     static final int INSERT_AT_END_OF_QUEUE_SECTION = 10;
     static final String EXTRA_CAN_ADD_TO_QUEUE_SECTION = "com.apple.android.music.playback.playbackstate.EXTRA_CAN_ADD_TO_QUEUE_SECTION";
+    static final String PLAY_PROVIDER = "com.apple.android.music.playback.action.PLAY_PROVIDER";
+    static final String ARG_PLAY_PROVIDER = "com.apple.android.music.playback.action.ARGUMENT_PLAYBACK_QUEUE_ITEM_PROVIDER";
+    static final String ARG_PLAY_INSERTION_TYPE = "com.apple.android.music.playback.action.ARGUMENT_PLAYBACK_QUEUE_INSERTION_TYPE";
     static final String REMOVE_QUEUE_ITEM = "com.apple.android.music.playback.command.REMOVE_QUEUE_ITEM";
     static final String ARG_QUEUE_ID = "com.apple.android.music.playback.command.ARGUMENT_PLAYBACK_QUEUE_ID";
 
@@ -189,6 +193,18 @@ public class MediaCtl {
                 b.putInt(ARG_INSERTION_TYPE, insertionType(c, arg));
                 c.sendCommand(ADD_QUEUE_ITEMS, b, null);
                 wait = Wait.QUEUE;
+                break;
+            }
+            case "play": {
+                // Apple Music's PLAY_PROVIDER action: start these songs with an explicit
+                // insertion type. KEEP_AND_REPLACE (6) / CLEAR_AND_REPLACE (5) are the
+                // app's own answers to the "keep or clear your queued songs?" prompt
+                // that playFromMediaId (plain REPLACE) triggers.
+                String[] ids = Arrays.copyOfRange(args, 2, args.length);
+                Bundle b = new Bundle();
+                b.putParcelable(ARG_PLAY_PROVIDER, new StorePlaybackQueueItemProvider(ids));
+                b.putInt(ARG_PLAY_INSERTION_TYPE, Integer.parseInt(arg));
+                c.sendCommand(PLAY_PROVIDER, b, null);
                 break;
             }
             case "remove": {
