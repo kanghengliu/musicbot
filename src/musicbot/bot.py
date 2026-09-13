@@ -22,6 +22,7 @@ class MusicBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.load_extension("musicbot.cogs.voice")
+        await self.load_extension("musicbot.cogs.control")
         if self.guild_ids:
             for gid in self.guild_ids:
                 guild = discord.Object(id=gid)

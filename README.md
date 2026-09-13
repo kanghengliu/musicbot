@@ -84,6 +84,9 @@ You should see `synced N commands to guild ...` and `logged in as ...`.
 |--------------------------------------|-------------------------------------------------------------|
 | `/ecaplay [channel]`                 | Join (your current voice channel by default) and stream. Restarts cleanly if already playing. |
 | `/ecaleave`                          | Stop streaming and disconnect.                              |
+| `/ecasearch <query>`                 | Search Apple Music and pick a song from a dropdown; it starts playing in WayDroid. |
+| `/ecaskip`                           | Skip to the next track.                                     |
+| `/ecapause`                          | Pause / resume.                                             |
 
 The source is fixed to `AUDIO_SOURCE` from `.env` (default `BotSink.monitor`) — change it there and restart the bot to switch.
 
@@ -96,6 +99,19 @@ The source is fixed to `AUDIO_SOURCE` from `.env` (default `BotSink.monitor`) �
 | `AUDIO_SOURCE`  | PipeWire/Pulse source to read. Default: `BotSink.monitor`.              |
 | `OPUS_BITRATE`  | Optional opus bitrate cap in kbps. Default: the server's boost-tier max. See note below. |
 | `LOG_LEVEL`     | `DEBUG` / `INFO` / `WARNING`. Default: `INFO`.                          |
+| `APPLE_MUSIC_STOREFRONT` | Storefront of the account in the app (e.g. `cn`, `us`). Search results are limited to it. Default: `cn`. |
+| `ITUNES_SEARCH_STOREFRONTS` | Stores searched via the iTunes Search API when the storefront's web search can't be parsed; results are then filtered to `APPLE_MUSIC_STOREFRONT`. Default: `us,hk,tw,jp`. |
+| `WAYDROID_ADB`  | WayDroid's adbd address. Default: `192.168.240.112:5555`.               |
+| `ADB_KEY`       | ADB private key (generated on first use). Default: `~/.config/musicbot/adbkey`. |
+| `CONTROL_ROLE_IDS` / `CONTROL_USER_IDS` | Who may use the Apple Music control commands. Both empty = everyone. |
+
+### Apple Music control
+
+The control commands don't tap the UI. `src/musicbot/mediactl.dex` (source and `build.sh` in `contrib/mediactl/`) is pushed to WayDroid over ADB and run with `app_process` as the shell user, which holds `MEDIA_CONTENT_CONTROL`; it calls Apple Music's MediaSession directly (`playFromMediaId`, `skipToNext`, `pause`/`play`) and reports whether the track actually changed.
+
+Search uses the storefront's `music.apple.com/<store>/search` page, because the iTunes Search API returns nothing for some stores (including `cn`). Song IDs are catalog-wide, but availability isn't — a song missing from the account's store won't start, and the bot says so.
+
+First use: WayDroid shows an **Allow USB debugging?** prompt for the bot's key — tick *Always allow* and accept. ADB must be enabled in WayDroid (`waydroid prop get persist.waydroid.adb`, or check that `192.168.240.112:5555` accepts connections).
 
 ### Bitrate
 
