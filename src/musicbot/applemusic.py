@@ -65,10 +65,39 @@ class NowPlaying:
 
 
 @dataclass(frozen=True)
+class QueueEntry:
+    id: str
+    title: str
+    artist: str
+    active: bool
+    # Apple Music orders the queue as: the user's "Playing Next" section, then the
+    # rest of the album/playlist being played, then songs Autoplay appended.
+    in_queue_section: bool = False
+    from_autoplay: bool = False
+    # Apple's internal id for this queue slot (what REMOVE_QUEUE_ITEM takes); -1 if absent.
+    queue_id: int = -1
+
+    def describe(self) -> str:
+        return f"{self.title} — {self.artist}" if self.artist else self.title
+
+
+@dataclass(frozen=True)
 class ControlResult:
     before: NowPlaying
     after: NowPlaying
     changed: bool
+    # The queue as the session exposes it — only a window of upcoming items,
+    # not Apple Music's whole queue.
+    queue: tuple[QueueEntry, ...] = ()
+
+    def queued(self, song_id: str) -> bool:
+        return any(entry.id == song_id for entry in self.upcoming())
+
+    def upcoming(self) -> list[QueueEntry]:
+        for i, entry in enumerate(self.queue):
+            if entry.active:
+                return list(self.queue[i + 1 :])
+        return list(self.queue[1:])
 
 
 class MediaCtlError(RuntimeError):
@@ -179,14 +208,28 @@ def _mediactl(*args: str) -> ControlResult:
             dev.close()
 
     rows: dict[str, NowPlaying] = {}
+    queue: list[QueueEntry] = []
     for line in out.splitlines():
         tag, _, rest = line.partition("\t")
         if tag in ("BEFORE", "AFTER", "TIMEOUT"):
             rows[tag] = _parse_row(rest)
+        elif tag == "ITEM":
+            active, song_id, title, artist, section, autoplay, queue_id = (rest.split("\t") + [""] * 7)[:7]
+            queue.append(
+                QueueEntry(
+                    id=song_id,
+                    title=title,
+                    artist=artist,
+                    active=active == "1",
+                    in_queue_section=section == "1",
+                    from_autoplay=autoplay == "1",
+                    queue_id=int(queue_id) if queue_id.lstrip("-").isdigit() else -1,
+                )
+            )
     if "BEFORE" not in rows:
         raise MediaCtlError(out.strip()[-500:] or "mediactl produced no output")
     after = rows.get("AFTER") or rows.get("TIMEOUT") or rows["BEFORE"]
-    return ControlResult(before=rows["BEFORE"], after=after, changed="AFTER" in rows)
+    return ControlResult(before=rows["BEFORE"], after=after, changed="AFTER" in rows, queue=tuple(queue))
 
 
 async def _control(*args: str) -> ControlResult:
@@ -203,3 +246,22 @@ async def skip() -> ControlResult:
 
 async def toggle_pause() -> ControlResult:
     return await _control("playpause")
+
+
+# Apple Music's PlaybackQueueInsertionType values.
+_INSERT_AT_END = 2
+_INSERT_AFTER_CURRENT = 3
+
+
+async def enqueue(song_id: str, *, next_up: bool) -> ControlResult:
+    """Insert into Apple Music's own queue — right after the current song, or at the end."""
+    return await _control("enqueue", str(_INSERT_AFTER_CURRENT if next_up else _INSERT_AT_END), song_id)
+
+
+async def upcoming() -> ControlResult:
+    return await _control("queue")
+
+
+async def remove(queue_id: int) -> ControlResult:
+    """Remove one queue slot by Apple's ITEM_QUEUE_ID (QueueEntry.queue_id)."""
+    return await _control("remove", str(queue_id))

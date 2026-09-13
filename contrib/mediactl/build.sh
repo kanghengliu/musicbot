@@ -22,8 +22,8 @@ fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-javac --release 11 -nowarn -cp "$cache/android.jar" -d "$tmp/classes" "$here/MediaCtl.java"
-java -cp "$cache/r8-$r8_version.jar" com.android.tools.r8.D8 \
-    --release --min-api 33 --lib "$cache/android.jar" --output "$tmp" "$tmp"/classes/*.class
+find "$here" -name '*.java' -print0 | xargs -0 javac --release 11 -nowarn -cp "$cache/android.jar" -d "$tmp/classes"
+find "$tmp/classes" -name '*.class' -print0 | xargs -0 java -cp "$cache/r8-$r8_version.jar" com.android.tools.r8.D8 \
+    --release --min-api 33 --lib "$cache/android.jar" --output "$tmp"
 cp "$tmp/classes.dex" "$repo/src/musicbot/mediactl.dex"
 echo "wrote $repo/src/musicbot/mediactl.dex"

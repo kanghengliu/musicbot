@@ -1,5 +1,6 @@
 import android.content.ComponentName;
 import android.content.ContextWrapper;
+import android.media.MediaDescription;
 import android.media.MediaMetadata;
 import android.media.session.MediaController;
 import android.media.session.MediaSession;
@@ -9,24 +10,47 @@ import android.os.Bundle;
 import android.os.IBinder;
 import android.os.IInterface;
 
+import com.apple.android.music.playback.queue.StorePlaybackQueueItemProvider;
+
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.List;
 
 /**
  * Drives Apple Music's MediaSession from the adb shell uid, which holds
  * MEDIA_CONTENT_CONTROL — so no APK, root, or UI taps are needed.
  *
- * Run: CLASSPATH=/data/local/tmp/musicbot-mediactl.dex app_process / MediaCtl <cmd> [arg]
- *   now | list | mediaid <storeId> | search <query> | uri <uri> | next | previous | playpause
+ * Run: CLASSPATH=/data/local/tmp/musicbot-mediactl.dex app_process / MediaCtl <cmd> [args]
+ *   now | list | queue | mediaid <storeId> | search <query> | uri <uri>
+ *   next | previous | playpause | enqueue <insertionType> <storeId>... | remove <itemQueueId>
  *
  * Output is tab-separated for the bot to parse:
  *   BEFORE  state artist title   (always)
  *   AFTER   state artist title   (the command took effect)
  *   TIMEOUT state artist title   (nothing changed within WAIT_MS)
+ *   ITEM    active mediaId title artist inQueueSection fromAutoplay itemQueueId
+ *           (queue/enqueue/remove: the visible queue; flags are 0/1)
  */
 public class MediaCtl {
     static final String PKG = "com.apple.android.music";
     static final long WAIT_MS = 10_000;
+
+    // Apple Music's own custom session command (handled in its media3 callback's
+    // onCustomCommand → MediaPlayerController.addQueueItems). Insertion types are
+    // PlaybackQueueInsertionType: 2 = AT_END, 3 = AFTER_CURRENT_ITEM.
+    static final String ADD_QUEUE_ITEMS = "com.apple.android.music.playback.command.ADD_QUEUE_ITEMS";
+    static final String ARG_PROVIDER = "com.apple.android.music.playback.command.ARGUMENT_PLAYBACK_QUEUE_ITEM_PROVIDER";
+    static final String ARG_INSERTION_TYPE = "com.apple.android.music.playback.command.ARGUMENT_PLAYBACK_QUEUE_INSERTION_TYPE";
+    static final String REMOVE_QUEUE_ITEM = "com.apple.android.music.playback.command.REMOVE_QUEUE_ITEM";
+    static final String ARG_QUEUE_ID = "com.apple.android.music.playback.command.ARGUMENT_PLAYBACK_QUEUE_ID";
+
+    // Per-item flags Apple Music puts in each QueueItem's description extras:
+    // in the user's "Playing Next" section, or appended by Autoplay.
+    static final String META_IN_QUEUE_SECTION = "com.apple.android.music.playback.metadata.METADATA_KEY_IS_IN_QUEUE_SECTION";
+    static final String META_FROM_AUTOPLAY = "com.apple.android.music.playback.metadata.METADATA_KEY_IS_FROM_CONTINUOUS_PLAYBACK";
+    static final String META_ITEM_QUEUE_ID = "com.apple.android.music.playback.metadata.ITEM_QUEUE_ID";
+
+    enum Wait { TRACK, PLAY_STATE, QUEUE }
 
     // MediaController only needs a context for getPackageName() on transport calls.
     static class ShellContext extends ContextWrapper {
@@ -68,8 +92,8 @@ public class MediaCtl {
         }
     }
 
-    static String clean(String s) {
-        return s == null ? "" : s.replace('\t', ' ').replace('\n', ' ');
+    static String clean(CharSequence s) {
+        return s == null ? "" : s.toString().replace('\t', ' ').replace('\n', ' ');
     }
 
     static String track(MediaController c) {
@@ -79,8 +103,33 @@ public class MediaCtl {
                 + clean(md.getString(MediaMetadata.METADATA_KEY_TITLE));
     }
 
+    static String queueKey(MediaController c) {
+        List<MediaSession.QueueItem> q = c.getQueue();
+        if (q == null) return "";
+        StringBuilder sb = new StringBuilder();
+        for (MediaSession.QueueItem it : q) sb.append(it.getDescription().getMediaId()).append(',');
+        return sb.toString();
+    }
+
     static void print(String tag, MediaController c) {
         System.out.println(tag + "\t" + stateName(c) + "\t" + track(c));
+    }
+
+    static void printQueue(MediaController c) {
+        List<MediaSession.QueueItem> q = c.getQueue();
+        if (q == null) return;
+        PlaybackState s = c.getPlaybackState();
+        long active = s == null ? -1 : s.getActiveQueueItemId();
+        for (MediaSession.QueueItem it : q) {
+            MediaDescription d = it.getDescription();
+            Bundle ex = d.getExtras();
+            boolean section = ex != null && ex.getBoolean(META_IN_QUEUE_SECTION);
+            boolean autoplay = ex != null && ex.getBoolean(META_FROM_AUTOPLAY);
+            long queueId = ex == null ? -1 : ex.getLong(META_ITEM_QUEUE_ID, -1);
+            System.out.println("ITEM\t" + (it.getQueueId() == active ? "1" : "0") + "\t" + clean(d.getMediaId())
+                    + "\t" + clean(d.getTitle()) + "\t" + clean(d.getSubtitle())
+                    + "\t" + (section ? "1" : "0") + "\t" + (autoplay ? "1" : "0") + "\t" + queueId);
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -99,12 +148,14 @@ public class MediaCtl {
         MediaController c = find(ctx);
         print("BEFORE", c);
         String beforeTrack = track(c);
+        String beforeQueue = queueKey(c);
         boolean wasPlaying = stateName(c).equals("playing");
 
         MediaController.TransportControls tc = c.getTransportControls();
-        boolean waitForTrack = true;
+        Wait wait = Wait.TRACK;
         switch (cmd) {
             case "now": return;
+            case "queue": printQueue(c); return;
             case "mediaid": tc.playFromMediaId(arg, new Bundle()); break;
             case "search": tc.playFromSearch(arg, new Bundle()); break;
             case "uri": tc.playFromUri(Uri.parse(arg), new Bundle()); break;
@@ -112,22 +163,43 @@ public class MediaCtl {
             case "previous": tc.skipToPrevious(); break;
             case "playpause":
                 if (wasPlaying) tc.pause(); else tc.play();
-                waitForTrack = false;
+                wait = Wait.PLAY_STATE;
                 break;
+            case "enqueue": {
+                String[] ids = Arrays.copyOfRange(args, 2, args.length);
+                Bundle b = new Bundle();
+                b.putParcelable(ARG_PROVIDER, new StorePlaybackQueueItemProvider(ids));
+                b.putInt(ARG_INSERTION_TYPE, Integer.parseInt(arg));
+                c.sendCommand(ADD_QUEUE_ITEMS, b, null);
+                wait = Wait.QUEUE;
+                break;
+            }
+            case "remove": {
+                Bundle b = new Bundle();
+                b.putLong(ARG_QUEUE_ID, Long.parseLong(arg));
+                c.sendCommand(REMOVE_QUEUE_ITEM, b, null);
+                wait = Wait.QUEUE;
+                break;
+            }
             default: throw new IllegalArgumentException("unknown command: " + cmd);
         }
 
         long deadline = System.currentTimeMillis() + WAIT_MS;
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(250);
-            boolean changed = waitForTrack
-                    ? !track(c).equals(beforeTrack)
-                    : stateName(c).equals("playing") != wasPlaying;
+            boolean changed;
+            switch (wait) {
+                case PLAY_STATE: changed = stateName(c).equals("playing") != wasPlaying; break;
+                case QUEUE: changed = !queueKey(c).equals(beforeQueue); break;
+                default: changed = !track(c).equals(beforeTrack);
+            }
             if (changed) {
                 print("AFTER", c);
+                if (wait == Wait.QUEUE) printQueue(c);
                 return;
             }
         }
         print("TIMEOUT", c);
+        if (wait == Wait.QUEUE) printQueue(c);
     }
 }

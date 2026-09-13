@@ -84,7 +84,8 @@ You should see `synced N commands to guild ...` and `logged in as ...`.
 |--------------------------------------|-------------------------------------------------------------|
 | `/ecaplay [channel]`                 | Join (your current voice channel by default) and stream. Restarts cleanly if already playing. |
 | `/ecaleave`                          | Stop streaming and disconnect.                              |
-| `/ecasearch <query>`                 | Search Apple Music and pick a song from a dropdown; it starts playing in WayDroid. |
+| `/ecasearch <query>`                 | Search Apple Music, pick a song from a dropdown, then **Play now**, **Play next**, or **Add to queue**. |
+| `/ecaqueue`                          | Show the current song and the next few in Apple Music's queue, grouped like the app: **Playing next** (added songs), the rest of the album/playlist, then **Autoplay**. |
 | `/ecaskip`                           | Skip to the next track.                                     |
 | `/ecapause`                          | Pause / resume.                                             |
 
@@ -108,6 +109,8 @@ The source is fixed to `AUDIO_SOURCE` from `.env` (default `BotSink.monitor`) �
 ### Apple Music control
 
 The control commands don't tap the UI. `src/musicbot/mediactl.dex` (source and `build.sh` in `contrib/mediactl/`) is pushed to WayDroid over ADB and run with `app_process` as the shell user, which holds `MEDIA_CONTENT_CONTROL`; it calls Apple Music's MediaSession directly (`playFromMediaId`, `skipToNext`, `pause`/`play`) and reports whether the track actually changed.
+
+Queueing uses Apple Music's own queue rather than one kept by the bot: MediaCtl sends the app's custom session command `com.apple.android.music.playback.command.ADD_QUEUE_ITEMS` with a `StorePlaybackQueueItemProvider` (a stand-in class with the app's class name and parcel layout, in `contrib/mediactl/com/…`) and an insertion type (`3` = after the current song, `2` = end of queue). These are app internals found by decompiling Apple Music, so an app update can break them; the bot reports a failure when the visible queue doesn't change. The session only exposes a window of upcoming songs, which is why `/ecaqueue` shows just the next few. With repeat-one on, queued songs never come up.
 
 Search uses the storefront's `music.apple.com/<store>/search` page, because the iTunes Search API returns nothing for some stores (including `cn`). Song IDs are catalog-wide, but availability isn't — a song missing from the account's store won't start, and the bot says so.
 
