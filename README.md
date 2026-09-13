@@ -13,6 +13,21 @@ Bridges a local PipeWire/PulseAudio sink monitor (e.g. Apple Music inside Waydro
 
 The bot doesn't talk to Waydroid directly. You route whatever you want streamed into the `BotSink` sink (via `pavucontrol` or `pw-link`); the bot just reads `BotSink.monitor`.
 
+## Requirements
+
+System packages (Arch names):
+
+| Package          | Used for                                                              |
+|------------------|-----------------------------------------------------------------------|
+| `ffmpeg`         | Reads the sink monitor and feeds PCM to discord.py.                   |
+| `opus`           | Voice encoding (libopus).                                             |
+| `pipewire-pulse` | `pactl` for the sink setup; `pw-link` (from `pipewire`) for auto-routing. |
+| `playerctl`      | "Now playing" rich presence. **Optional, but without it presence silently does nothing** — no error is logged. |
+
+    sudo pacman -S --needed ffmpeg opus pipewire-pulse playerctl
+
+`busctl` (systemd) is also used by presence to match `MPRIS_PLAYER` against the player's Identity.
+
 ## One-time setup
 
 ### 1. Create the virtual sink
@@ -101,4 +116,5 @@ You also need to actually crank the **channel** bitrate to match in Discord: rig
 
 - **"Connecting to voice failed"** — bot lacks `Connect`/`Speak` on the channel, or you're missing `libopus` (most distros bundle it; on Arch: `pacman -S opus`).
 - **Bot joins but no sound** — check `pactl list short source-outputs` while playing; ffmpeg should appear as a client of `BotSink.monitor`. Also confirm the Waydroid stream is actually routed to `BotSink` in `pavucontrol`.
+- **Bot doesn't show what's playing** — check `playerctl --list-all` works (install `playerctl` if not found) and that `MPRIS_PLAYER` matches the player's bus name or Identity. Presence only shows while the player's status is Playing.
 - **Slash commands missing** — set `GUILD_ID` for instant guild sync; global sync can take up to an hour.
