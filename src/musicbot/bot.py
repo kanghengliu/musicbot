@@ -65,7 +65,16 @@ async def _amain() -> None:
 
     async with bot:
         bot_task = asyncio.create_task(bot.start(token))
-        await stop.wait()
+        stop_task = asyncio.create_task(stop.wait())
+        # Watch both: if the bot dies on its own (e.g. login fails on DNS at boot),
+        # exit non-zero so systemd's Restart=on-failure kicks in instead of idling.
+        await asyncio.wait({bot_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        if not stop_task.done():
+            stop_task.cancel()
+            exc = bot_task.exception()
+            if exc is not None:
+                raise exc
+            raise SystemExit("bot stopped unexpectedly")
         log.info("shutdown signal received")
         await bot.close()
         await bot_task
