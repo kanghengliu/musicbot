@@ -18,6 +18,10 @@ def _id_set(name: str) -> set[int]:
 # Both empty = anyone who can run slash commands may control playback.
 CONTROL_ROLE_IDS = _id_set("CONTROL_ROLE_IDS")
 CONTROL_USER_IDS = _id_set("CONTROL_USER_IDS")
+# Songs /ecaqueue lists per section before collapsing the rest into "…and N more".
+_PLAYING_NEXT_LIMIT = 20
+_CONTINUE_PLAYING_LIMIT = 5
+_AUTOPLAY_LIMIT = 3
 
 
 def _may_control(interaction: discord.Interaction) -> bool:
@@ -232,27 +236,45 @@ class Control(commands.Cog):
             return
         lines = [f"**Now:** {_now(result.before)}"]
         upcoming = result.upcoming()
-        # Same grouping Apple Music's own queue screen uses, in play order.
+        # Same grouping and names as Apple Music's own queue screen, in play order.
+        # Each with how many songs to list: people's own picks matter most.
         groups = [
-            ("Playing next", [e for e in upcoming if e.in_queue_section]),
-            ("From the album/playlist", [e for e in upcoming if not e.in_queue_section and not e.from_autoplay]),
-            ("Autoplay", [e for e in upcoming if e.from_autoplay and not e.in_queue_section]),
+            ("Playing Next", _PLAYING_NEXT_LIMIT, [e for e in upcoming if e.in_queue_section]),
+            (
+                "Continue Playing",
+                _CONTINUE_PLAYING_LIMIT,
+                [e for e in upcoming if not e.in_queue_section and not e.from_autoplay],
+            ),
+            ("Autoplay", _AUTOPLAY_LIMIT, [e for e in upcoming if e.from_autoplay and not e.in_queue_section]),
         ]
+        footer = "-# Apple Music only exposes the next few songs for autoplay."
+        # A long playlist's Continue Playing section alone can blow past Discord's
+        # 2000-character message limit, so cap each section and the message as a whole.
+        budget = 2000 - len(footer) - 1
         n = 0
-        for title, entries in groups:
+        for i, (title, limit, entries) in enumerate(groups):
             if not entries:
                 continue
             lines.append(f"**{title}:**")
-            for entry in entries:
-                n += 1
-                lines.append(f"`{n:>2}.` {escape_markdown(entry.describe())}")
+            # Room for this section's "…and N more" line plus a header and one for each later section.
+            reserve = 30 + 60 * sum(1 for _, _, later in groups[i + 1 :] if later)
+            shown = 0
+            for entry in entries[:limit]:
+                line = f"`{n + shown + 1:>2}.` {escape_markdown(entry.describe())}"
+                if len("\n".join(lines)) + len(line) + 1 + reserve > budget:
+                    break
+                lines.append(line)
+                shown += 1
+            if shown < len(entries):
+                lines.append(f"-# …and {len(entries) - shown} more")
+            n += len(entries)
         if n:
-            lines.append("-# Apple Music only exposes the next few songs.")
+            lines.append(footer)
         else:
             lines.append("Nothing queued after this song.")
-        await interaction.followup.send("\n".join(lines))
+        await interaction.followup.send("\n".join(lines)[:2000])
 
-    @app_commands.command(name="ecaremove", description="不想听这首了🗑️")
+    @app_commands.command(name="ecaremove", description="不想听这首🗑️")
     @controllers_only
     async def ecaremove(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -265,10 +287,10 @@ class Control(commands.Cog):
         # Only songs people added; the album/playlist and Autoplay stay untouched.
         entries = [e for e in result.upcoming() if e.in_queue_section and e.queue_id != -1][:25]
         if not entries:
-            await interaction.followup.send("Nothing in **Playing next** to remove.", ephemeral=True)
+            await interaction.followup.send("Nothing in **Playing Next** to remove.", ephemeral=True)
             return
         await interaction.followup.send(
-            "Which song should come out of **Playing next**?",
+            "Which song should come out of **Playing Next**?",
             view=RemoveView(interaction.user.id, entries),
             ephemeral=True,
         )
