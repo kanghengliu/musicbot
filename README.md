@@ -85,7 +85,7 @@ You should see `synced N commands to guild ...` and `logged in as ...`.
 | `/ecajoin [channel]`                 | Join (your current voice channel by default) and stream. Restarts cleanly if already playing. |
 | `/ecaleave`                          | Stop streaming and disconnect.                              |
 | `/ecasearch <query>`                 | Search Apple Music, pick a song from a dropdown, then **Play now**, **Play next**, or **Add to queue**. |
-| `/ecaqueue`                          | Show the current song and what's next in Apple Music's queue, grouped like the app: **Playing Next** (added songs), **Continue Playing** (the rest of the album/playlist), then **Autoplay**. Buttons underneath: **Queue** (search for a song to add), **Remove**, and **Skip**. |
+| `/ecaqueue`                          | Show the current song and what's next in Apple Music's queue, grouped like the app: **Playing Next** (added songs), **Continue Playing** (the rest of the album/playlist), then **Autoplay**. Buttons underneath: **Queue** (search for a song to add), **Remove**, **Skip**, and **Refresh** (re-reads the queue into that message; its cooldown doubles on repeated presses, up to 60s). The buttons keep working after a bot restart. |
 | `/ecaremove`                         | Pick a song from **Playing Next** (songs people added) and remove it. The album/playlist and Autoplay can't be removed this way. |
 | `/ecaskip`                           | Skip to the next track.                                     |
 | `/ecapause`                          | Pause / resume.                                             |

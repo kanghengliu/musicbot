@@ -1,5 +1,7 @@
 import logging
+import math
 import os
+import time
 
 import discord
 from discord import app_commands
@@ -22,6 +24,9 @@ CONTROL_USER_IDS = _id_set("CONTROL_USER_IDS")
 _PLAYING_NEXT_LIMIT = 20
 _CONTINUE_PLAYING_LIMIT = 5
 _AUTOPLAY_LIMIT = 3
+# Refresh button cooldown per message: starts here, doubles on quick repeat presses, capped.
+_REFRESH_MIN_S = 2.0
+_REFRESH_MAX_S = 60.0
 
 
 def _may_control(interaction: discord.Interaction) -> bool:
@@ -46,6 +51,48 @@ def _now(np: applemusic.NowPlaying) -> str:
 
 def _song(song: applemusic.Song) -> str:
     return escape_markdown(f"{song.title} — {song.artist}" if song.artist else song.title)
+
+
+def _render_queue(result: applemusic.ControlResult) -> str:
+    lines = [f"**Now:** {_now(result.after)}"]
+    upcoming = result.upcoming()
+    # Same grouping and names as Apple Music's own queue screen, in play order.
+    # Each with how many songs to list: people's own picks matter most.
+    groups = [
+        ("Playing Next", _PLAYING_NEXT_LIMIT, [e for e in upcoming if e.in_queue_section]),
+        (
+            "Continue Playing",
+            _CONTINUE_PLAYING_LIMIT,
+            [e for e in upcoming if not e.in_queue_section and not e.from_autoplay],
+        ),
+        ("Autoplay", _AUTOPLAY_LIMIT, [e for e in upcoming if e.from_autoplay and not e.in_queue_section]),
+    ]
+    footer = "-# Apple Music only exposes the next few songs for autoplay."
+    # A long playlist's Continue Playing section alone can blow past Discord's
+    # 2000-character message limit, so cap each section and the message as a whole.
+    budget = 2000 - len(footer) - 1
+    n = 0
+    for i, (title, limit, entries) in enumerate(groups):
+        if not entries:
+            continue
+        lines.append(f"**{title}:**")
+        # Room for this section's "…and N more" line plus a header and one for each later section.
+        reserve = 30 + 60 * sum(1 for _, _, later in groups[i + 1 :] if later)
+        shown = 0
+        for entry in entries[:limit]:
+            line = f"`{n + shown + 1:>2}.` {escape_markdown(entry.describe())}"
+            if len("\n".join(lines)) + len(line) + 1 + reserve > budget:
+                break
+            lines.append(line)
+            shown += 1
+        if shown < len(entries):
+            lines.append(f"-# …and {len(entries) - shown} more")
+        n += len(entries)
+    if n:
+        lines.append(footer)
+    else:
+        lines.append("Nothing queued after this song.")
+    return "\n".join(lines)[:2000]
 
 
 class SongSelect(discord.ui.Select):
@@ -144,7 +191,6 @@ class SongActions(OwnerView):
             announcement = f"➕ {interaction.user.mention} queued **{_song(song)}** {where}"
         await interaction.followup.send(announcement, allowed_mentions=discord.AllowedMentions.none())
 
-
 class RemoveSelect(discord.ui.Select):
     def __init__(self, entries: list[applemusic.QueueEntry]):
         # Keyed by Apple's queue slot id, not song id: the same song can be queued twice.
@@ -179,7 +225,6 @@ class RemoveSelect(discord.ui.Select):
             f"➖ {interaction.user.mention} removed **{name}** from the queue",
             allowed_mentions=discord.AllowedMentions.none(),
         )
-
 
 class RemoveView(OwnerView):
     def __init__(self, owner_id: int, entries: list[applemusic.QueueEntry]):
@@ -259,26 +304,23 @@ class SearchModal(discord.ui.Modal, title="Search Apple Music"):
         await _search(interaction, self.query.value)
 
 
+async def _deny_non_controllers(interaction: discord.Interaction) -> bool:
+    """Tell the user off and return True if they may not control playback."""
+    if _may_control(interaction):
+        return False
+    await interaction.response.send_message("You're not allowed to control playback.", ephemeral=True)
+    return True
+
+
 class QueueActions(discord.ui.View):
-    """Buttons under /ecaqueue. Anyone allowed to control playback may use them."""
+    """Buttons under every /ecaqueue message. Persistent (fixed custom_ids, no
+    timeout, registered at startup), so old messages' buttons keep working across
+    restarts. One instance serves all messages."""
 
     def __init__(self):
-        super().__init__(timeout=900)
-        self.message: discord.Message | None = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if _may_control(interaction):
-            return True
-        await interaction.response.send_message("You're not allowed to control playback.", ephemeral=True)
-        return False
-
-    async def on_timeout(self):
-        # Discord keeps showing the buttons after the view stops listening; clicks would just fail.
-        if self.message is not None:
-            try:
-                await self.message.edit(view=None)
-            except discord.HTTPException:
-                pass
+        super().__init__(timeout=None)
+        # message id -> (current cooldown, when it was last refreshed)
+        self._refreshed: dict[int, tuple[float, float]] = {}
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         log.exception("queue button failed", exc_info=error)
@@ -288,24 +330,60 @@ class QueueActions(discord.ui.View):
         else:
             await interaction.response.send_message(msg, ephemeral=True)
 
-    @discord.ui.button(label="Queue", emoji="🎵", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Queue", emoji="🎵", style=discord.ButtonStyle.primary, custom_id="ecaqueue:queue")
     async def search(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if await _deny_non_controllers(interaction):
+            return
         await interaction.response.send_modal(SearchModal())
 
-    @discord.ui.button(label="Remove", emoji="🗑️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Remove", emoji="🗑️", style=discord.ButtonStyle.secondary, custom_id="ecaqueue:remove")
     async def remove(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if await _deny_non_controllers(interaction):
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         await _remove_prompt(interaction)
 
-    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="ecaqueue:skip")
     async def skip(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if await _deny_non_controllers(interaction):
+            return
         await interaction.response.defer(thinking=True)
         await _skip(interaction)
+
+    # Anyone may refresh, like anyone may run /ecaqueue.
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="ecaqueue:refresh")
+    async def refresh(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        assert interaction.message is not None
+        message_id = interaction.message.id
+        now = time.monotonic()
+        # Forget messages whose backoff has fully reset.
+        self._refreshed = {m: (d, t) for m, (d, t) in self._refreshed.items() if now < t + 2 * d}
+        delay, last = self._refreshed.get(message_id, (0.0, float("-inf")))
+        if now < last + delay:
+            await interaction.response.send_message(
+                f"Just refreshed — try again in {math.ceil(last + delay - now)}s.", ephemeral=True
+            )
+            return
+        # Each refresh soon after the cooldown ends doubles it; waiting as long again resets it.
+        delay = min(delay * 2, _REFRESH_MAX_S) if now < last + 2 * delay else _REFRESH_MIN_S
+        self._refreshed[message_id] = (delay, now)
+
+        await interaction.response.defer()
+        try:
+            result = await applemusic.upcoming()
+        except Exception as exc:
+            log.warning("upcoming failed: %r", exc)
+            await interaction.followup.send(f"Couldn't read Apple Music's queue: `{exc}`", ephemeral=True)
+            return
+        await interaction.edit_original_response(content=_render_queue(result))
 
 
 class Control(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.queue_actions = QueueActions()
+        # Routes button presses on every /ecaqueue message, including ones posted before a restart.
+        bot.add_view(self.queue_actions)
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CheckFailure):
@@ -334,46 +412,7 @@ class Control(commands.Cog):
             log.warning("upcoming failed: %r", exc)
             await interaction.followup.send(f"Couldn't read Apple Music's queue: `{exc}`")
             return
-        lines = [f"**Now:** {_now(result.before)}"]
-        upcoming = result.upcoming()
-        # Same grouping and names as Apple Music's own queue screen, in play order.
-        # Each with how many songs to list: people's own picks matter most.
-        groups = [
-            ("Playing Next", _PLAYING_NEXT_LIMIT, [e for e in upcoming if e.in_queue_section]),
-            (
-                "Continue Playing",
-                _CONTINUE_PLAYING_LIMIT,
-                [e for e in upcoming if not e.in_queue_section and not e.from_autoplay],
-            ),
-            ("Autoplay", _AUTOPLAY_LIMIT, [e for e in upcoming if e.from_autoplay and not e.in_queue_section]),
-        ]
-        footer = "-# Apple Music only exposes the next few songs for autoplay."
-        # A long playlist's Continue Playing section alone can blow past Discord's
-        # 2000-character message limit, so cap each section and the message as a whole.
-        budget = 2000 - len(footer) - 1
-        n = 0
-        for i, (title, limit, entries) in enumerate(groups):
-            if not entries:
-                continue
-            lines.append(f"**{title}:**")
-            # Room for this section's "…and N more" line plus a header and one for each later section.
-            reserve = 30 + 60 * sum(1 for _, _, later in groups[i + 1 :] if later)
-            shown = 0
-            for entry in entries[:limit]:
-                line = f"`{n + shown + 1:>2}.` {escape_markdown(entry.describe())}"
-                if len("\n".join(lines)) + len(line) + 1 + reserve > budget:
-                    break
-                lines.append(line)
-                shown += 1
-            if shown < len(entries):
-                lines.append(f"-# …and {len(entries) - shown} more")
-            n += len(entries)
-        if n:
-            lines.append(footer)
-        else:
-            lines.append("Nothing queued after this song.")
-        view = QueueActions()
-        view.message = await interaction.followup.send("\n".join(lines)[:2000], view=view, wait=True)
+        await interaction.followup.send(_render_queue(result), view=self.queue_actions)
 
     @app_commands.command(name="ecaremove", description="不想听这首🗑️")
     @controllers_only
