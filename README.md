@@ -82,11 +82,11 @@ You should see `synced N commands to guild ...` and `logged in as ...`.
 
 | Command                              | What it does                                                |
 |--------------------------------------|-------------------------------------------------------------|
-| `/ecaplay [channel]`                 | Join (your current voice channel by default) and stream. Restarts cleanly if already playing. |
+| `/ecajoin [channel]`                 | Join (your current voice channel by default) and stream. Restarts cleanly if already playing. |
 | `/ecaleave`                          | Stop streaming and disconnect.                              |
 | `/ecasearch <query>`                 | Search Apple Music, pick a song from a dropdown, then **Play now**, **Play next**, or **Add to queue**. |
-| `/ecaqueue`                          | Show the current song and the next few in Apple Music's queue, grouped like the app: **Playing next** (added songs), the rest of the album/playlist, then **Autoplay**. |
-| `/ecaremove`                         | Pick a song from **Playing next** (songs people added) and remove it. The album/playlist and Autoplay can't be removed this way. |
+| `/ecaqueue`                          | Show the current song and what's next in Apple Music's queue, grouped like the app: **Playing Next** (added songs), **Continue Playing** (the rest of the album/playlist), then **Autoplay**. Buttons underneath: **Queue** (search for a song to add), **Remove**, and **Skip**. |
+| `/ecaremove`                         | Pick a song from **Playing Next** (songs people added) and remove it. The album/playlist and Autoplay can't be removed this way. |
 | `/ecaskip`                           | Skip to the next track.                                     |
 | `/ecapause`                          | Pause / resume.                                             |
 

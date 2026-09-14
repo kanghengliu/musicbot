@@ -73,9 +73,9 @@ class Voice(commands.Cog):
             return None
         return channel
 
-    @app_commands.command(name="ecaplay", description="eca在听什么👀")
+    @app_commands.command(name="ecajoin", description="eca在听什么👀")
     @app_commands.describe(channel="Voice channel to join (defaults to yours).")
-    async def ecaplay(
+    async def ecajoin(
         self,
         interaction: discord.Interaction,
         channel: discord.VoiceChannel | None = None,

@@ -187,6 +187,122 @@ class RemoveView(OwnerView):
         self.add_item(RemoveSelect(entries))
 
 
+async def _search(interaction: discord.Interaction, query: str) -> None:
+    """Reply with a song picker. The interaction must already be deferred ephemerally."""
+    try:
+        songs = await applemusic.search(query)
+    except Exception as exc:
+        log.warning("search(%r) failed: %r", query, exc)
+        await interaction.followup.send(f"Search failed: `{exc}`", ephemeral=True)
+        return
+    if not songs:
+        await interaction.followup.send(
+            f"No songs found in the {applemusic.STOREFRONT.upper()} store for **{escape_markdown(query)}**.",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        f"Results for **{escape_markdown(query)}**:",
+        view=SearchView(interaction.user.id, songs),
+        ephemeral=True,
+    )
+
+
+async def _remove_prompt(interaction: discord.Interaction) -> None:
+    """Reply with a Playing Next picker. The interaction must already be deferred ephemerally."""
+    try:
+        result = await applemusic.upcoming()
+    except Exception as exc:
+        log.warning("upcoming failed: %r", exc)
+        await interaction.followup.send(f"Couldn't read Apple Music's queue: `{exc}`", ephemeral=True)
+        return
+    # Only songs people added; the album/playlist and Autoplay stay untouched.
+    entries = [e for e in result.upcoming() if e.in_queue_section and e.queue_id != -1][:25]
+    if not entries:
+        await interaction.followup.send("Nothing in **Playing Next** to remove.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        "Which song should come out of **Playing Next**?",
+        view=RemoveView(interaction.user.id, entries),
+        ephemeral=True,
+    )
+
+
+async def _skip(interaction: discord.Interaction) -> None:
+    """Skip and announce it publicly. The interaction must already be deferred."""
+    try:
+        result = await applemusic.skip()
+    except Exception as exc:
+        log.warning("skip failed: %r", exc)
+        await interaction.followup.send(f"Couldn't control Apple Music in WayDroid: `{exc}`")
+        return
+    if result.changed:
+        await interaction.followup.send(
+            f"⏭️ {interaction.user.mention} skipped to **{_now(result.after)}**",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    else:
+        # Songs started via /ecasearch replace the queue with just that song, and
+        # repeat-one makes "next" replay the current track. The framework
+        # MediaController doesn't expose repeat mode, so we can't tell which.
+        await interaction.followup.send(
+            f"Skip didn't change the song — still on **{_now(result.after)}**. "
+            "Repeat-one may be on in Apple Music, or there's nothing queued after this song."
+        )
+
+
+class SearchModal(discord.ui.Modal, title="Search Apple Music"):
+    query = discord.ui.TextInput(label="Song title, artist, or both", max_length=100)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _search(interaction, self.query.value)
+
+
+class QueueActions(discord.ui.View):
+    """Buttons under /ecaqueue. Anyone allowed to control playback may use them."""
+
+    def __init__(self):
+        super().__init__(timeout=900)
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _may_control(interaction):
+            return True
+        await interaction.response.send_message("You're not allowed to control playback.", ephemeral=True)
+        return False
+
+    async def on_timeout(self):
+        # Discord keeps showing the buttons after the view stops listening; clicks would just fail.
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        log.exception("queue button failed", exc_info=error)
+        msg = f"Something went wrong: `{error}`"
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="Queue", emoji="🎵", style=discord.ButtonStyle.primary)
+    async def search(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.send_modal(SearchModal())
+
+    @discord.ui.button(label="Remove", emoji="🗑️", style=discord.ButtonStyle.secondary)
+    async def remove(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _remove_prompt(interaction)
+
+    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(thinking=True)
+        await _skip(interaction)
+
+
 class Control(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -207,23 +323,7 @@ class Control(commands.Cog):
     @controllers_only
     async def ecasearch(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            songs = await applemusic.search(query)
-        except Exception as exc:
-            log.warning("search(%r) failed: %r", query, exc)
-            await interaction.followup.send(f"Search failed: `{exc}`", ephemeral=True)
-            return
-        if not songs:
-            await interaction.followup.send(
-                f"No songs found in the {applemusic.STOREFRONT.upper()} store for **{escape_markdown(query)}**.",
-                ephemeral=True,
-            )
-            return
-        await interaction.followup.send(
-            f"Results for **{escape_markdown(query)}**:",
-            view=SearchView(interaction.user.id, songs),
-            ephemeral=True,
-        )
+        await _search(interaction, query)
 
     @app_commands.command(name="ecaqueue", description="接下来放什么📜")
     async def ecaqueue(self, interaction: discord.Interaction):
@@ -272,49 +372,20 @@ class Control(commands.Cog):
             lines.append(footer)
         else:
             lines.append("Nothing queued after this song.")
-        await interaction.followup.send("\n".join(lines)[:2000])
+        view = QueueActions()
+        view.message = await interaction.followup.send("\n".join(lines)[:2000], view=view, wait=True)
 
     @app_commands.command(name="ecaremove", description="不想听这首🗑️")
     @controllers_only
     async def ecaremove(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            result = await applemusic.upcoming()
-        except Exception as exc:
-            log.warning("upcoming failed: %r", exc)
-            await interaction.followup.send(f"Couldn't read Apple Music's queue: `{exc}`", ephemeral=True)
-            return
-        # Only songs people added; the album/playlist and Autoplay stay untouched.
-        entries = [e for e in result.upcoming() if e.in_queue_section and e.queue_id != -1][:25]
-        if not entries:
-            await interaction.followup.send("Nothing in **Playing Next** to remove.", ephemeral=True)
-            return
-        await interaction.followup.send(
-            "Which song should come out of **Playing Next**?",
-            view=RemoveView(interaction.user.id, entries),
-            ephemeral=True,
-        )
+        await _remove_prompt(interaction)
 
     @app_commands.command(name="ecaskip", description="切歌⏭️")
     @controllers_only
     async def ecaskip(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
-        try:
-            result = await applemusic.skip()
-        except Exception as exc:
-            log.warning("skip failed: %r", exc)
-            await interaction.followup.send(f"Couldn't control Apple Music in WayDroid: `{exc}`")
-            return
-        if result.changed:
-            await interaction.followup.send(f"⏭️ Now playing **{_now(result.after)}**")
-        else:
-            # Songs started via /ecasearch replace the queue with just that song, and
-            # repeat-one makes "next" replay the current track. The framework
-            # MediaController doesn't expose repeat mode, so we can't tell which.
-            await interaction.followup.send(
-                f"Skip didn't change the song — still on **{_now(result.after)}**. "
-                "Repeat-one may be on in Apple Music, or there's nothing queued after this song."
-            )
+        await _skip(interaction)
 
     @app_commands.command(name="ecapause", description="暂停/继续⏯️")
     @controllers_only
