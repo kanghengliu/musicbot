@@ -105,6 +105,8 @@ The source is fixed to `AUDIO_SOURCE` from `.env` (default `BotSink.monitor`) �
 | `ITUNES_SEARCH_STOREFRONTS` | Stores searched via the iTunes Search API when the storefront's web search can't be parsed; results are then filtered to `APPLE_MUSIC_STOREFRONT`. Default: `us,hk,tw,jp`. |
 | `WAYDROID_ADB`  | WayDroid's adbd address. Default: `192.168.240.112:5555`.               |
 | `ADB_KEY`       | ADB private key (generated on first use). Default: `~/.config/musicbot/adbkey`. |
+| `APPLE_MUSIC_LAUNCH` | Command run when WayDroid or Apple Music isn't up. Default: `systemd-run --user --collect --quiet waydroid app launch com.apple.android.music`. |
+| `APPLE_MUSIC_LAUNCH_WAIT_SECONDS` | How long to wait for Apple Music's media session after launching it. Default: `90`. |
 | `CONTROL_ROLE_IDS` / `CONTROL_USER_IDS` | Who may use the Apple Music control commands. Both empty = everyone. |
 
 ### Apple Music control
@@ -114,6 +116,8 @@ The control commands don't tap the UI. `src/musicbot/mediactl.dex` (source and `
 Queueing uses Apple Music's own queue rather than one kept by the bot: MediaCtl sends the app's custom session command `com.apple.android.music.playback.command.ADD_QUEUE_ITEMS` with a `StorePlaybackQueueItemProvider` (a stand-in class with the app's class name and parcel layout, in `contrib/mediactl/com/…`) and an insertion type (`3` = front of Playing Next, `10` = end of Playing Next; not `2`, which appends after Autoplay). **Play now** uses the app's `PLAY_PROVIDER` action with `KEEP_AND_REPLACE` (`6`) rather than `playFromMediaId`: a plain replace makes Apple Music pop a "keep playing or clear the songs you previously queued?" dialog on its own screen whenever Playing Next isn't empty, which nobody in Discord can answer. Songs people queued are kept. The app ignores `10` while Playing Next is empty — it signals this with `EXTRA_CAN_ADD_TO_QUEUE_SECTION=false` in the session extras — so MediaCtl falls back to `3`, which is the same position then. These are app internals found by decompiling Apple Music, so an app update can break them; the bot reports a failure when the visible queue doesn't change. The session only exposes a window of upcoming songs, which is why `/ecaqueue` shows just the next few. With repeat-one on, queued songs never come up.
 
 Search uses the storefront's `music.apple.com/<store>/search` page, because the iTunes Search API returns nothing for some stores (including `cn`). Song IDs are catalog-wide, but availability isn't — a song missing from the account's store won't start, and the bot says so.
+
+WayDroid doesn't need to be running when the bot starts. If ADB can't connect or Apple Music has no media session, the bot runs `APPLE_MUSIC_LAUNCH` (which starts the WayDroid session too), waits for the session, and then retries the command. The failed attempt never reached the app, so nothing runs twice. The launch goes through `systemd-run` so WayDroid lives in its own scope and survives bot restarts.
 
 First use: WayDroid shows an **Allow USB debugging?** prompt for the bot's key — tick *Always allow* and accept. ADB must be enabled in WayDroid (`waydroid prop get persist.waydroid.adb`, or check that `192.168.240.112:5555` accepts connections).
 

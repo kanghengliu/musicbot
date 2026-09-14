@@ -19,6 +19,7 @@ import aiohttp
 from adb_shell.adb_device import AdbDeviceTcp
 from adb_shell.auth.keygen import keygen
 from adb_shell.auth.sign_pythonrsa import PythonRSASigner
+from adb_shell.exceptions import AdbConnectionError, TcpTimeoutException
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,14 @@ FALLBACK_STOREFRONTS = [
 ]
 ADB_ADDRESS = os.environ.get("WAYDROID_ADB", "192.168.240.112:5555")
 ADB_KEY = Path(os.environ.get("ADB_KEY", "~/.config/musicbot/adbkey")).expanduser()
+PACKAGE = "com.apple.android.music"
+# Run when WayDroid or Apple Music isn't up. `waydroid app launch` starts the
+# session too if needed, and stays running as its host — so it goes in its own
+# systemd scope, or restarting the bot would take WayDroid down with it.
+LAUNCH_COMMAND = shlex.split(
+    os.environ.get("APPLE_MUSIC_LAUNCH", f"systemd-run --user --collect --quiet waydroid app launch {PACKAGE}")
+)
+LAUNCH_WAIT_S = float(os.environ.get("APPLE_MUSIC_LAUNCH_WAIT_SECONDS", "90"))
 
 _DEX_LOCAL = Path(__file__).with_name("mediactl.dex")
 _DEX_REMOTE = "/data/local/tmp/musicbot-mediactl.dex"
@@ -102,6 +111,11 @@ class ControlResult:
 
 class MediaCtlError(RuntimeError):
     pass
+
+
+class AppleMusicUnavailable(MediaCtlError):
+    """WayDroid or Apple Music isn't up. Raised before any command reaches the app,
+    so the command is safe to retry once it's launched."""
 
 
 def _parse_web_search(page: str) -> list[Song]:
@@ -191,7 +205,10 @@ def _mediactl(*args: str) -> ControlResult:
     with _adb_lock:
         dev = AdbDeviceTcp(host, int(port), default_transport_timeout_s=10)
         try:
-            dev.connect(rsa_keys=[_signer()], auth_timeout_s=30)
+            try:
+                dev.connect(rsa_keys=[_signer()], auth_timeout_s=30)
+            except (OSError, AdbConnectionError, TcpTimeoutException) as exc:
+                raise AppleMusicUnavailable(f"WayDroid isn't reachable over ADB at {ADB_ADDRESS} ({exc})") from exc
             remote_md5 = dev.shell(f"md5sum {_DEX_REMOTE} 2>/dev/null").split(" ")[0].strip()
             if remote_md5 != local_md5:
                 log.info("pushing mediactl.dex to WayDroid")
@@ -227,12 +244,56 @@ def _mediactl(*args: str) -> ControlResult:
                 )
             )
     if "BEFORE" not in rows:
+        if f"no {PACKAGE} media session" in out:
+            raise AppleMusicUnavailable("Apple Music isn't running in WayDroid")
         raise MediaCtlError(out.strip()[-500:] or "mediactl produced no output")
     after = rows.get("AFTER") or rows.get("TIMEOUT") or rows["BEFORE"]
     return ControlResult(before=rows["BEFORE"], after=after, changed="AFTER" in rows, queue=tuple(queue))
 
 
+async def _launch_and_wait() -> None:
+    """Start WayDroid/Apple Music and wait until its media session answers."""
+    log.info("launching Apple Music: %s", shlex.join(LAUNCH_COMMAND))
+    proc = await asyncio.create_subprocess_exec(
+        *LAUNCH_COMMAND, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+    )
+    _, err = await proc.communicate()
+    if proc.returncode:
+        raise MediaCtlError(f"launching Apple Music failed: {err.decode(errors='replace').strip()}")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + LAUNCH_WAIT_S
+    while True:
+        await asyncio.sleep(3)
+        try:
+            await asyncio.to_thread(_mediactl, "now")
+            log.info("Apple Music is up")
+            return
+        # While Android boots, adbd and app_process fail in assorted ways.
+        except Exception as exc:
+            if loop.time() >= deadline:
+                raise AppleMusicUnavailable(
+                    f"Apple Music still isn't up {LAUNCH_WAIT_S:.0f}s after launching it ({exc})"
+                ) from exc
+
+
+_launching: asyncio.Task[None] | None = None
+
+
+async def _launch() -> None:
+    # Commands arriving while it's down share one launch (and one failure).
+    global _launching
+    if _launching is None or _launching.done():
+        _launching = asyncio.create_task(_launch_and_wait())
+    # Shielded: one caller's interaction being cancelled mustn't abort the others' wait.
+    await asyncio.shield(_launching)
+
+
 async def _control(*args: str) -> ControlResult:
+    try:
+        return await asyncio.to_thread(_mediactl, *args)
+    except AppleMusicUnavailable as exc:
+        log.info("%s; launching it and retrying", exc)
+    await _launch()
     return await asyncio.to_thread(_mediactl, *args)
 
 
