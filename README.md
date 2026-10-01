@@ -134,6 +134,12 @@ The bot sets the opus encoder bitrate to each server's boost-tier maximum and di
 
 You also need to actually crank the **channel** bitrate to match in Discord: right-click the voice channel → Edit Channel → Audio Bitrate. The wire bitrate is `min(channel_bitrate, encoder_bitrate)` — if the channel is left at the 64 kbps default, that's what you'll hear regardless of the server's tier.
 
+### Muting locally
+
+`contrib/localmute/localmute.sh` stops you hearing WayDroid while the bot keeps streaming it. It retargets WayDroid's stream at BotSink, so WirePlumber drops the link to your speakers or headphones. Run it again to turn local audio back on; WayDroid then follows your default output as usual. It also takes `on`, `off` and `status`.
+
+Muting WayDroid's stream volume would silence the bot too, since stream volume applies before the split. It needs a WayDroid stream to exist, so start playback first.
+
 ## Troubleshooting
 
 - **"Connecting to voice failed"** — bot lacks `Connect`/`Speak` on the channel, or you're missing `libopus` (most distros bundle it; on Arch: `pacman -S opus`).
