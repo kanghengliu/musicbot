@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 import os
@@ -27,6 +28,8 @@ _AUTOPLAY_LIMIT = 3
 # Refresh button cooldown per message: starts here, doubles on quick repeat presses, capped.
 _REFRESH_MIN_S = 2.0
 _REFRESH_MAX_S = 60.0
+# How long Refresh waits on Apple Music before acking; Discord drops interactions not answered within 3s.
+_REFRESH_ACK_S = 2.5
 
 
 def _may_control(interaction: discord.Interaction) -> bool:
@@ -368,14 +371,26 @@ class QueueActions(discord.ui.View):
         delay = min(delay * 2, _REFRESH_MAX_S) if now < last + 2 * delay else _REFRESH_MIN_S
         self._refreshed[message_id] = (delay, now)
 
-        await interaction.response.defer()
+        # Answer with the new content directly when it arrives in time, so the button's
+        # spinner lasts until the message updates; defer only if Apple Music is slow.
+        fetch = asyncio.ensure_future(applemusic.upcoming())
+        done, _ = await asyncio.wait({fetch}, timeout=_REFRESH_ACK_S)
+        if not done:
+            await interaction.response.defer()
         try:
-            result = await applemusic.upcoming()
+            result = await fetch
         except Exception as exc:
             log.warning("upcoming failed: %r", exc)
-            await interaction.followup.send(f"Couldn't read Apple Music's queue: `{exc}`", ephemeral=True)
+            msg = f"Couldn't read Apple Music's queue: `{exc}`"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
             return
-        await interaction.edit_original_response(content=_render_queue(result))
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content=_render_queue(result))
+        else:
+            await interaction.response.edit_message(content=_render_queue(result))
 
 
 class Control(commands.Cog):
