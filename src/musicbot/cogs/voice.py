@@ -32,6 +32,11 @@ def _tracked_client(cog: "Voice") -> type[discord.VoiceClient]:
         # Set by /ecaleave: the one time a real leave is wanted.
         leaving = False
 
+        async def _voice_connect(self, *, self_deaf: bool = False, self_mute: bool = False) -> None:
+            # Reconnects copy mute/deafen from the bot's current voice state,
+            # which during a handover is the standby's (muted and deafened).
+            await super()._voice_connect(self_deaf=False, self_mute=False)
+
         async def _voice_disconnect(self) -> None:
             # discord.py sends a gateway leave on every retry and reconnect
             # (then joins again), and when it gives up. That empties the
