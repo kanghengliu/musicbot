@@ -1,9 +1,14 @@
 import asyncio
+import json
 import logging
+import os
+import time
+from pathlib import Path
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.voice_state import ConnectionFlowState, VoiceConnectionState
 
 from musicbot.audio import bitrate_for, make_source
 
@@ -13,14 +18,38 @@ log = logging.getLogger(__name__)
 # repeats until we're back in or someone runs /ecaleave.
 REJOIN_BACKOFF = (5, 15, 60, 300)
 
+# Voice target per guild, kept across restarts so a reboot isn't a leave.
+STATE_FILE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "musicbot/voice.json"
+
+# How long a clean shutdown waits for the cloud standby to take the channel.
+HANDOFF_TIMEOUT = 10
+
 
 def _tracked_client(cog: "Voice") -> type[discord.VoiceClient]:
+    class GuardedConnectionState(VoiceConnectionState):
+        async def _voice_disconnect(self) -> None:
+            # discord.py sends a gateway leave whenever its voice connection
+            # gives up. The voice state is per-bot, so if the standby holds
+            # the channel by then, that leave would kick it and empty the
+            # channel. Only leave a voice state that is our own session's.
+            state = self.voice_client.guild.me.voice
+            own = cog.bot.ws.session_id if cog.bot.ws is not None else None
+            if state is not None and state.channel is not None and own is not None and state.session_id != own:
+                log.info("not sending voice leave: another session (the standby) holds the channel")
+                self.state = ConnectionFlowState.disconnected
+                self._disconnected.set()
+                return
+            await super()._voice_disconnect()
+
     class TrackedVoiceClient(discord.VoiceClient):
+        def create_connection_state(self) -> VoiceConnectionState:
+            return GuardedConnectionState(self)
+
         async def on_voice_state_update(self, data) -> None:
             # Runs before discord.py's own handler, so we see its
             # expecting-disconnect flag before it gets reset.
-            cog._on_own_voice_state(self, data)
-            await super().on_voice_state_update(data)
+            if cog._on_own_voice_state(self, data):
+                await super().on_voice_state_update(data)
 
     return TrackedVoiceClient
 
@@ -33,15 +62,53 @@ class Voice(commands.Cog):
         self._expect_stop: dict[int, bool] = {}
         # Per-guild voice channel we're supposed to be in, and the rejoin loop
         # running for it, if any. Set by /ecajoin; cleared by /ecaleave or by
-        # someone disconnecting the bot. In-memory only, so a restart also
-        # counts as leaving.
-        self._target: dict[int, int] = {}
+        # someone disconnecting the bot. Persisted, so restarts rejoin.
+        self._target: dict[int, int] = self._load_targets()
         self._rejoin_tasks: dict[int, asyncio.Task[None]] = {}
         self._client_cls = _tracked_client(self)
+        # Cloud standby lease (None when STANDBY_SSH_HOST isn't set).
+        self._link = getattr(bot, "standby", None)
+        if self._link is not None:
+            self._link.set_targets(self._target)
+        self._started = False
+        self._handing_off = False
 
     def cog_unload(self) -> None:
         for task in self._rejoin_tasks.values():
             task.cancel()
+
+    @staticmethod
+    def _load_targets() -> dict[int, int]:
+        try:
+            raw = json.loads(STATE_FILE.read_text())
+            return {int(gid): int(cid) for gid, cid in raw.items()}
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError, AttributeError) as exc:
+            log.warning("ignoring unreadable %s: %r", STATE_FILE, exc)
+            return {}
+
+    def _set_target(self, gid: int, channel_id: int | None) -> None:
+        if channel_id is None:
+            self._target.pop(gid, None)
+        else:
+            self._target[gid] = channel_id
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({str(g): c for g, c in self._target.items()}))
+            tmp.replace(STATE_FILE)
+        except OSError as exc:
+            log.warning("couldn't save %s: %r", STATE_FILE, exc)
+        if self._link is not None:
+            self._link.set_targets(self._target)
+
+    @staticmethod
+    async def _drop_client(vc: discord.VoiceClient) -> None:
+        # Tear down our end without sending a leave: the gateway voice state is
+        # per-bot, so a leave would also kick the standby's session out.
+        await vc._connection.soft_disconnect()
+        vc.cleanup()
 
     def _play(self, vc: discord.VoiceClient, gid: int) -> int:
         # play() builds a fresh encoder each call, so bitrate/FEC must be passed
@@ -72,11 +139,21 @@ class Voice(commands.Cog):
 
         return _after
 
-    def _on_own_voice_state(self, vc: discord.VoiceClient, data) -> None:
+    def _on_own_voice_state(self, vc: discord.VoiceClient, data) -> bool:
+        """Returns whether discord.py's own handler should see the update."""
         gid = vc.guild.id
-        if gid not in self._target:
-            return
         channel_id = data.get("channel_id")
+        own = self.bot.ws.session_id if self.bot.ws is not None else None
+        if own is not None and data.get("session_id") not in (None, own):
+            # The update belongs to another login of this bot — the cloud
+            # standby. Keep it away from discord.py, which would adopt the
+            # foreign session.
+            if channel_id is not None and not self._handing_off:
+                log.info("standby took the voice channel while we're up — taking it back")
+                asyncio.create_task(self._reclaim(vc, gid))
+            return False
+        if gid not in self._target:
+            return True
         if channel_id is None:
             # A drop discord.py started itself (failed reconnect) is expected;
             # anything else is a mod disconnect or the channel being deleted.
@@ -84,29 +161,66 @@ class Voice(commands.Cog):
             # turn off rejoining.
             if not getattr(vc._connection, "_expecting_disconnect", True):
                 log.info("disconnected from voice by someone else — not rejoining")
-                self._target.pop(gid, None)
+                self._set_target(gid, None)
                 self._cancel_rejoin(gid)
         elif int(channel_id) != self._target[gid]:
             log.info("moved to channel %s — rejoins will target it", channel_id)
-            self._target[gid] = int(channel_id)
+            self._set_target(gid, int(channel_id))
+        return True
 
-    def _schedule_rejoin(self, gid: int) -> None:
+    async def _reclaim(self, vc: discord.VoiceClient, gid: int) -> None:
+        if vc.is_playing():
+            self._expect_stop[gid] = True
+            vc.stop()
+        await self._drop_client(vc)
+        self._schedule_rejoin(gid)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        # on_ready repeats after full reconnects; startup adoption runs once.
+        if self._started:
+            return
+        self._started = True
+        own = self.bot.ws.session_id if self.bot.ws is not None else None
+        for guild in self.bot.guilds:
+            state = guild.me.voice
+            if state is None or not isinstance(state.channel, discord.VoiceChannel):
+                continue
+            # Fresh process, so any voice state is someone else's: the cloud
+            # standby, or a ghost of our previous run. Take over its channel.
+            log.info(
+                "bot already in %s (session %s, ours %s) — taking it over",
+                state.channel.name, state.session_id, own,
+            )
+            self._set_target(guild.id, state.channel.id)
+        for gid in list(self._target):
+            self._schedule_rejoin(gid, first_delay=0)
+
+    def _schedule_rejoin(self, gid: int, first_delay: float | None = None) -> None:
+        if self._handing_off:
+            return
         task = self._rejoin_tasks.get(gid)
         if task is not None and not task.done():
             return
-        self._rejoin_tasks[gid] = asyncio.create_task(self._rejoin(gid), name=f"voice-rejoin-{gid}")
+        self._rejoin_tasks[gid] = asyncio.create_task(
+            self._rejoin(gid, first_delay), name=f"voice-rejoin-{gid}"
+        )
 
     def _cancel_rejoin(self, gid: int) -> None:
         task = self._rejoin_tasks.pop(gid, None)
         if task is not None and task is not asyncio.current_task():
             task.cancel()
 
-    async def _rejoin(self, gid: int) -> None:
+    async def _rejoin(self, gid: int, first_delay: float | None = None) -> None:
         attempt = 0
         while gid in self._target:
-            delay = REJOIN_BACKOFF[min(attempt, len(REJOIN_BACKOFF) - 1)]
+            if attempt == 0 and first_delay is not None:
+                delay = first_delay
+            else:
+                delay = REJOIN_BACKOFF[min(attempt, len(REJOIN_BACKOFF) - 1)]
             attempt += 1
-            log.info("voice dropped — rejoin attempt %d in %ds", attempt, delay)
+            if delay:
+                log.info("voice dropped — rejoin attempt %d in %ds", attempt, delay)
             await asyncio.sleep(delay)
             await self.bot.wait_until_ready()
 
@@ -117,7 +231,7 @@ class Voice(commands.Cog):
             channel = guild.get_channel(channel_id)
             if not isinstance(channel, discord.VoiceChannel):
                 log.warning("rejoin: channel %s is gone, giving up", channel_id)
-                self._target.pop(gid, None)
+                self._set_target(gid, None)
                 return
 
             vc: discord.VoiceClient | None = guild.voice_client  # type: ignore[assignment]
@@ -126,20 +240,57 @@ class Voice(commands.Cog):
             if vc is not None:
                 # Leftover client from the failed handshake would make
                 # connect() raise "Already connected".
-                await vc.disconnect(force=True)
+                await self._drop_client(vc)
 
             try:
                 vc = await channel.connect(timeout=30.0, cls=self._client_cls)
             except Exception as exc:
                 log.warning("rejoin attempt %d failed: %r", attempt, exc)
                 stale = guild.voice_client
-                if stale is not None:
-                    await stale.disconnect(force=True)
+                if isinstance(stale, discord.VoiceClient):
+                    await self._drop_client(stale)
                 continue
 
             self._play(vc, gid)
-            log.info("rejoined %s after %d attempt(s)", channel.name, attempt)
+            log.info("joined %s after %d attempt(s)", channel.name, attempt)
             return
+
+    async def handoff(self) -> None:
+        """On shutdown, pass the channel to the cloud standby without leaving.
+
+        Our voice client is torn down quietly (no leave), the standby is told
+        to join, and we wait until Discord shows its session in the channel,
+        so the channel never empties. Without a standby this is a no-op and
+        the normal close leaves voice.
+        """
+        clients = [vc for vc in self.bot.voice_clients if isinstance(vc, discord.VoiceClient)]
+        if self._link is None or not self._target or not clients:
+            return
+        self._handing_off = True
+        for gid in list(self._rejoin_tasks):
+            self._cancel_rejoin(gid)
+        for vc in clients:
+            self._expect_stop[vc.guild.id] = True
+            vc.stop()
+            await self._drop_client(vc)
+        if not await self._link.handoff():
+            log.warning("handoff: standby link is down; leaving the voice state for it to take over")
+            return
+
+        own = self.bot.ws.session_id if self.bot.ws is not None else None
+
+        def taken(gid: int) -> bool:
+            guild = self.bot.get_guild(gid)
+            state = guild.me.voice if guild is not None else None
+            return state is not None and state.channel is not None and state.session_id != own
+
+        deadline = time.monotonic() + HANDOFF_TIMEOUT
+        while time.monotonic() < deadline:
+            if all(taken(gid) for gid in self._target):
+                log.info("handoff: standby holds the channel")
+                return
+            await asyncio.sleep(0.2)
+        log.warning("handoff: standby didn't take over within %ds", HANDOFF_TIMEOUT)
 
     async def _resolve_channel(
         self,
@@ -193,7 +344,7 @@ class Voice(commands.Cog):
 
         gid = interaction.guild.id
         self._cancel_rejoin(gid)
-        self._target[gid] = target.id
+        self._set_target(gid, target.id)
 
         vc: discord.VoiceClient | None = interaction.guild.voice_client  # type: ignore[assignment]
         if vc is None:
@@ -218,15 +369,21 @@ class Voice(commands.Cog):
         gid = interaction.guild.id
         task = self._rejoin_tasks.get(gid)
         rejoining = task is not None and not task.done()
-        self._target.pop(gid, None)
+        self._set_target(gid, None)
         self._cancel_rejoin(gid)
         vc: discord.VoiceClient | None = interaction.guild.voice_client  # type: ignore[assignment]
-        if vc is None:
+        if vc is not None:
+            self._expect_stop[gid] = True
+            await vc.disconnect(force=False)
+        # The standby or a dead session of ours may still hold the channel;
+        # an explicit leave clears whichever session it is.
+        held = interaction.guild.me.voice is not None and interaction.guild.me.voice.channel is not None
+        if held:
+            await interaction.guild.change_voice_state(channel=None)
+        if vc is None and not held:
             msg = "Stopped trying to rejoin." if rejoining else "Not connected."
             await interaction.response.send_message(msg, ephemeral=True)
             return
-        self._expect_stop[interaction.guild.id] = True
-        await vc.disconnect(force=False)
         await interaction.response.send_message("Disconnected.")
 
 

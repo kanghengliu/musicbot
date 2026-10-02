@@ -82,8 +82,8 @@ You should see `synced N commands to guild ...` and `logged in as ...`.
 
 | Command                              | What it does                                                |
 |--------------------------------------|-------------------------------------------------------------|
-| `/ecajoin [channel]`                 | Join (your current voice channel by default) and stream. Restarts cleanly if already playing. |
-| `/ecaleave`                          | Stop streaming and disconnect.                              |
+| `/ecajoin [channel]`                 | Join (your current voice channel by default) and stream. Restarts cleanly if already playing. The bot keeps coming back to this channel after voice drops and restarts until `/ecaleave` or a mod disconnects it. |
+| `/ecaleave`                          | Stop streaming and disconnect. Also clears the cloud standby out of the channel. |
 | `/ecasearch <query>`                 | Search Apple Music, pick a song from a dropdown, then **Play now**, **Play next**, or **Add to queue**. |
 | `/ecaqueue`                          | Show the current song and what's next in Apple Music's queue, grouped like the app: **Playing Next** (added songs), **Continue Playing** (the rest of the album/playlist), then **Autoplay**. Buttons underneath: **Queue** (search for a song to add), **Remove**, **Skip**, and **Refresh** (re-reads the queue into that message; its cooldown doubles on repeated presses, up to 60s). The buttons keep working after a bot restart. |
 | `/ecaremove`                         | Pick a song from **Playing Next** (songs people added) and remove it. The album/playlist and Autoplay can't be removed this way. |
@@ -108,6 +108,8 @@ The source is fixed to `AUDIO_SOURCE` from `.env` (default `BotSink.monitor`) �
 | `APPLE_MUSIC_LAUNCH` | Command run when WayDroid or Apple Music isn't up. Default: `systemd-run --user --collect --quiet waydroid app launch com.apple.android.music`. |
 | `APPLE_MUSIC_LAUNCH_WAIT_SECONDS` | How long to wait for Apple Music's media session after launching it. Default: `90`. |
 | `CONTROL_ROLE_IDS` / `CONTROL_USER_IDS` | Who may use the Apple Music control commands. Both empty = everyone. |
+| `STANDBY_SSH_HOST` | SSH host running the cloud standby (see below). Empty = no standby. |
+| `STANDBY_SSH_COMMAND` | Command run on that host to receive heartbeats. Default: `musicbot-standby/.venv/bin/python musicbot-standby/standby.py relay`. |
 
 ### Apple Music control
 
@@ -139,6 +141,34 @@ You also need to actually crank the **channel** bitrate to match in Discord: rig
 `contrib/localmute/localmute.sh` stops you hearing WayDroid while the bot keeps streaming it. It retargets WayDroid's stream at BotSink, so WirePlumber drops the link to your speakers or headphones. Run it again to turn local audio back on; WayDroid then follows your default output as usual. It also takes `on`, `off` and `status`.
 
 Muting WayDroid's stream volume would silence the bot too, since stream volume applies before the split. It needs a WayDroid stream to exist, so start playback first.
+
+### Cloud standby
+
+`standby/standby.py` runs on an always-on VM and keeps the bot sitting in its voice channel while this machine is off or offline, so the channel never empties and its "active for" timer doesn't reset. It logs in with the same bot token but only joins and leaves. It plays no audio and ignores commands.
+
+The local bot keeps one `ssh $STANDBY_SSH_HOST` session open and sends a heartbeat with its target channel every 10s. The standby:
+
+- **Holds the channel** if heartbeats stop for 30s. Discord removes a dead session from voice about 80s after it goes silent; measured 2026-10-02. When the standby joins, it takes the slot over before the channel can empty.
+- **Joins immediately** when the local bot shuts down cleanly (service stop, reboot). The local bot waits up to 10s for the standby to appear, then exits without leaving voice.
+- **Steps aside** when the local bot comes back. The local bot takes the channel on startup or rejoin, and Discord moves the voice session to it.
+- **Stays out** after `/ecaleave`, or when a mod disconnects the bot, until the local bot is heard from again.
+
+The target channel is saved in `~/.local/state/musicbot/voice.json`, so the local bot rejoins after restarts on its own.
+
+Both sides log Discord's voice-channel timer events (`voice timer: channel … start_time=…`, where `RESET` means the channel emptied).
+
+Deploy (the VM needs SSH access from this machine and `uv`):
+
+```bash
+ssh vm 'mkdir -p ~/musicbot-standby ~/.config/systemd/user'
+scp standby/standby.py vm:musicbot-standby/
+scp standby/musicbot-standby.service vm:.config/systemd/user/
+grep '^DISCORD_TOKEN=' .env | ssh vm 'umask 077; cat > ~/musicbot-standby/.env'
+ssh vm 'cd ~/musicbot-standby && uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "discord.py==2.7.1" \
+  && sudo loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now musicbot-standby'
+```
+
+Then set `STANDBY_SSH_HOST=vm` in `.env` and restart the bot. The SSH key must work without an agent, because the systemd service has none. `STANDBY_OBSERVE=1` in the VM's `.env` makes the standby log what it would do without joining. On Oracle Linux, user-service logs go to the system journal: `sudo journalctl _SYSTEMD_USER_UNIT=musicbot-standby.service`.
 
 ## Troubleshooting
 

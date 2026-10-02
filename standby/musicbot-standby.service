@@ -1,0 +1,14 @@
+[Unit]
+Description=musicbot cloud standby — holds the voice channel while the local bot is down
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/musicbot-standby
+EnvironmentFile=%h/musicbot-standby/.env
+ExecStart=%h/musicbot-standby/.venv/bin/python %h/musicbot-standby/standby.py run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
