@@ -23,19 +23,24 @@ STATE_FILE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/stat
 
 # How long a clean shutdown waits for the cloud standby to take the channel.
 HANDOFF_TIMEOUT = 10
+# How long a reconnect waits for the standby to hold the slot.
+BOUNCE_TIMEOUT = 3
 
 
 def _tracked_client(cog: "Voice") -> type[discord.VoiceClient]:
     class GuardedConnectionState(VoiceConnectionState):
+        # Set by /ecaleave: the one time a real leave is wanted.
+        leaving = False
+
         async def _voice_disconnect(self) -> None:
-            # discord.py sends a gateway leave whenever its voice connection
-            # gives up. The voice state is per-bot, so if the standby holds
-            # the channel by then, that leave would kick it and empty the
-            # channel. Only leave a voice state that is our own session's.
-            state = self.voice_client.guild.me.voice
-            own = cog.bot.ws.session_id if cog.bot.ws is not None else None
-            if state is not None and state.channel is not None and own is not None and state.session_id != own:
-                log.info("not sending voice leave: another session (the standby) holds the channel")
+            # discord.py sends a gateway leave on every retry and reconnect
+            # (then joins again), and when it gives up. That empties the
+            # channel for a moment, resetting its timer, or kicks the standby
+            # if it holds the channel. Simply skipping it doesn't work either:
+            # Discord ignores a join to the channel a session is already in,
+            # so the retry never gets a voice server. Instead the standby takes
+            # the slot, and our retry's join moves it back with a fresh server.
+            if not self.leaving and await cog._hold_slot_for_reconnect(self.voice_client.guild):
                 self.state = ConnectionFlowState.disconnected
                 self._disconnected.set()
                 return
@@ -72,6 +77,9 @@ class Voice(commands.Cog):
             self._link.set_targets(self._target)
         self._started = False
         self._handing_off = False
+        # gid -> monotonic time we asked the standby to hold the slot for a
+        # reconnect; its voice updates are expected until ours come back.
+        self._bouncing: dict[int, float] = {}
 
     def cog_unload(self) -> None:
         for task in self._rejoin_tasks.values():
@@ -148,10 +156,13 @@ class Voice(commands.Cog):
             # The update belongs to another login of this bot — the cloud
             # standby. Keep it away from discord.py, which would adopt the
             # foreign session.
-            if channel_id is not None and not self._handing_off:
+            bouncing = time.monotonic() - self._bouncing.get(gid, -1e9) < 60
+            if channel_id is not None and not self._handing_off and not bouncing:
                 log.info("standby took the voice channel while we're up — taking it back")
                 asyncio.create_task(self._reclaim(vc, gid))
             return False
+        if channel_id is not None:
+            self._bouncing.pop(gid, None)
         if gid not in self._target:
             return True
         if channel_id is None:
@@ -167,6 +178,32 @@ class Voice(commands.Cog):
             log.info("moved to channel %s — rejoins will target it", channel_id)
             self._set_target(gid, int(channel_id))
         return True
+
+    async def _hold_slot_for_reconnect(self, guild: discord.Guild) -> bool:
+        """True if discord.py's leave can be skipped: someone else holds the
+        channel, or the standby just took it for us. False = really leave."""
+        own = self.bot.ws.session_id if self.bot.ws is not None else None
+        state = guild.me.voice
+        if state is None or state.channel is None:
+            return True
+        if state.session_id != own:
+            return True
+        link = self._link
+        if link is None or not link.healthy:
+            log.info("reconnecting without a standby — leaving first (channel timer may reset)")
+            return False
+        self._bouncing[guild.id] = time.monotonic()
+        if not await link.bounce():
+            return False
+        deadline = time.monotonic() + BOUNCE_TIMEOUT
+        while time.monotonic() < deadline:
+            state = guild.me.voice
+            if state is not None and state.channel is not None and state.session_id != own:
+                log.info("standby holds the slot while we reconnect")
+                return True
+            await asyncio.sleep(0.05)
+        log.warning("standby didn't take the slot within %ds — leaving to reconnect", BOUNCE_TIMEOUT)
+        return False
 
     async def _reclaim(self, vc: discord.VoiceClient, gid: int) -> None:
         if vc.is_playing():
@@ -374,6 +411,7 @@ class Voice(commands.Cog):
         vc: discord.VoiceClient | None = interaction.guild.voice_client  # type: ignore[assignment]
         if vc is not None:
             self._expect_stop[gid] = True
+            vc._connection.leaving = True  # type: ignore[attr-defined]
             await vc.disconnect(force=False)
         # The standby or a dead session of ours may still hold the channel;
         # an explicit leave clears whichever session it is.

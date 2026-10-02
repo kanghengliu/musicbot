@@ -37,6 +37,9 @@ class StandbyLink:
         self.command = command
         self.targets: dict[int, int] = {}
         self.state = "alive"
+        # Changes whenever we ask the standby to hold the slot for a reconnect.
+        self.bounce_id: str | None = None
+        self._last_ok = 0.0
         self._wake = asyncio.Event()
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
@@ -67,6 +70,16 @@ class StandbyLink:
         self.targets = dict(targets)
         self._wake.set()
 
+    @property
+    def healthy(self) -> bool:
+        proc = self._proc
+        return proc is not None and proc.returncode is None and time.monotonic() - self._last_ok < 2 * HEARTBEAT
+
+    async def bounce(self) -> bool:
+        """Ask the standby to take the channel now so we can re-handshake."""
+        self.bounce_id = f"{time.time():.6f}"
+        return await self._send()
+
     async def handoff(self) -> bool:
         """Tell the standby to take the channel now, ahead of our shutdown."""
         self.state = "handoff"
@@ -76,6 +89,7 @@ class StandbyLink:
         payload = {
             "state": self.state,
             "targets": {str(gid): str(cid) for gid, cid in self.targets.items()},
+            "bounce": self.bounce_id,
             "sent_at": time.time(),
         }
         return (json.dumps(payload) + "\n").encode()
@@ -90,6 +104,7 @@ class StandbyLink:
         except (OSError, asyncio.TimeoutError) as exc:
             log.warning("standby link: write failed: %r", exc)
             return False
+        self._last_ok = time.monotonic()
         return True
 
     async def _run(self) -> None:

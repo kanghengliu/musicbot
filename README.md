@@ -150,6 +150,7 @@ The local bot keeps one `ssh $STANDBY_SSH_HOST` session open and sends a heartbe
 
 - **Holds the channel** if heartbeats stop for 30s. Discord removes a dead session from voice about 80s after it goes silent; measured 2026-10-02. When the standby joins, it takes the slot over before the channel can empty.
 - **Joins immediately** when the local bot shuts down cleanly (service stop, reboot). The local bot waits up to 10s for the standby to appear, then exits without leaving voice.
+- **Holds the slot during voice reconnects.** discord.py reconnects by leaving and rejoining, which empties the channel for a moment and resets the timer. Re-sending a join for the channel the bot is already in gets no reply from Discord. So the local bot never sends that leave. It asks the standby to take the slot (about 50ms), then joins back. The change of session makes Discord send a fresh voice server. Without a reachable standby, it falls back to leaving and rejoining.
 - **Steps aside** when the local bot comes back. The local bot takes the channel on startup or rejoin, and Discord moves the voice session to it.
 - **Stays out** after `/ecaleave`, or when a mod disconnects the bot, until the local bot is heard from again.
 

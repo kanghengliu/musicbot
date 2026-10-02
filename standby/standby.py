@@ -45,7 +45,7 @@ LEASE_FILE = STATE_DIR / "lease.json"
 
 STALE_AFTER = float(os.environ.get("STANDBY_STALE_SECONDS", "30"))
 ORPHAN_GRACE = 2.0
-TICK = 1.0
+TICK = 0.25
 # Observe-only: log voice/timer events and decisions, never join or leave.
 OBSERVE = os.environ.get("STANDBY_OBSERVE", "").strip() not in ("", "0")
 
@@ -73,6 +73,7 @@ class Lease:
         self.state: str = data.get("state", "alive")
         self.targets: dict[int, int] = {int(g): int(c) for g, c in (data.get("targets") or {}).items()}
         self.received_at: float = float(data.get("received_at", 0))
+        self.bounce: str | None = data.get("bounce")
 
     @property
     def fresh(self) -> bool:
@@ -134,6 +135,10 @@ class Standby(discord.Client):
         self._next_attempt: dict[int, float] = {}
         self._failures: dict[int, int] = {}
         self._last_reason: dict[int, str] = {}
+        # Last bounce request handled; seeded from the lease at startup so an
+        # old request isn't replayed.
+        self._bounce_seen: str | None = Lease.load().bounce
+        self._bounce_pending: set[int] = set()
 
     async def setup_hook(self) -> None:
         self._connection.parsers["VOICE_CHANNEL_START_TIME_UPDATE"] = self._on_voice_timer
@@ -182,6 +187,10 @@ class Standby(discord.Client):
                 self._orphaned[gid] = time.monotonic()
             return
         self._orphaned.pop(gid, None)
+        if after.session_id == mine:
+            # Our join landed; a reconnect hold is served even if the local
+            # bot takes the slot back before the next tick sees us holding it.
+            self._bounce_pending.discard(gid)
         if after.session_id != mine and before.session_id == mine and before.channel is not None:
             log.info("local bot took the channel — standing down")
             self._displaced[gid] = lease.received_at
@@ -203,6 +212,8 @@ class Standby(discord.Client):
             return False, "kicked"
         if lease.state == "handoff":
             return True, "local handed off"
+        if gid in self._bounce_pending:
+            return True, "local is reconnecting"
         if not lease.fresh and gid not in self._displaced:
             return True, f"lease stale (>{STALE_AFTER:.0f}s)"
         orphaned = self._orphaned.get(gid)
@@ -218,6 +229,14 @@ class Standby(discord.Client):
         for gid, at in list(self._displaced.items()):
             if lease.received_at > at:
                 del self._displaced[gid]
+        if lease.bounce != self._bounce_seen:
+            self._bounce_seen = lease.bounce
+            if lease.fresh and lease.bounce is not None:
+                # Local is re-handshaking voice: hold the slot so Discord hands
+                # it a fresh voice server when it joins back.
+                for gid in lease.targets:
+                    self._bounce_pending.add(gid)
+                    self._next_attempt.pop(gid, None)
 
         for guild in self.guilds:
             gid = guild.id
@@ -235,6 +254,7 @@ class Standby(discord.Client):
             target = lease.targets.get(gid)
             if holding is not None and holding.id == target:
                 self._failures.pop(gid, None)
+                self._bounce_pending.discard(gid)
             if want and target is not None and (holding is None or holding.id != target):
                 await self._join(guild, target)
             elif not want and holding is not None and lease.fresh and target is None:
