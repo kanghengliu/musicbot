@@ -267,16 +267,21 @@ class Standby(discord.Client):
                 await guild.change_voice_state(channel=None)
 
     async def _update_presence(self, lease: Lease) -> None:
-        # Only while local is down: it owns the presence otherwise, and resends
-        # it on startup, which replaces ours.
+        # Only while local is down. Discord keeps showing a status this
+        # session set even after the local bot sets its own, and changing it
+        # back doesn't hand the display over either; a fresh login with no
+        # status does (that's how the standby ran before it had one). So once
+        # local has the channel back, restart (systemd Restart=always).
         local_down = lease.state == "handoff" or not lease.fresh
-        if local_down and not self._sleeping:
-            log.info("local is down — status: %s", SLEEP_STATUS)
-            if not OBSERVE:
-                await self.change_presence(status=discord.Status.idle, activity=discord.CustomActivity(name=SLEEP_STATUS))
-        elif not local_down and self._sleeping:
-            log.info("local is back — leaving the status to it")
-        self._sleeping = local_down
+        if local_down:
+            if not self._sleeping:
+                log.info("local is down — status: %s", SLEEP_STATUS)
+                if not OBSERVE:
+                    await self.change_presence(status=discord.Status.idle, activity=discord.CustomActivity(name=SLEEP_STATUS))
+                self._sleeping = True
+        elif self._sleeping and not any(self._holding(g) for g in self.guilds):
+            log.info("local is back and holds the channel — restarting to drop our status")
+            await self.close()
 
     async def _join(self, guild: discord.Guild, channel_id: int) -> None:
         gid = guild.id
