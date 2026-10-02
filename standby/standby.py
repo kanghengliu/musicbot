@@ -45,6 +45,8 @@ LEASE_FILE = STATE_DIR / "lease.json"
 
 STALE_AFTER = float(os.environ.get("STANDBY_STALE_SECONDS", "30"))
 ORPHAN_GRACE = 2.0
+# Custom status shown while the local bot is down (status goes idle too).
+SLEEP_STATUS = os.environ.get("STANDBY_STATUS", "💤 Sleeping")
 TICK = 0.25
 # Observe-only: log voice/timer events and decisions, never join or leave.
 OBSERVE = os.environ.get("STANDBY_OBSERVE", "").strip() not in ("", "0")
@@ -139,6 +141,7 @@ class Standby(discord.Client):
         # old request isn't replayed.
         self._bounce_seen: str | None = Lease.load().bounce
         self._bounce_pending: set[int] = set()
+        self._sleeping = False
 
     async def setup_hook(self) -> None:
         self._connection.parsers["VOICE_CHANNEL_START_TIME_UPDATE"] = self._on_voice_timer
@@ -229,6 +232,7 @@ class Standby(discord.Client):
         for gid, at in list(self._displaced.items()):
             if lease.received_at > at:
                 del self._displaced[gid]
+        await self._update_presence(lease)
         if lease.bounce != self._bounce_seen:
             self._bounce_seen = lease.bounce
             if lease.fresh and lease.bounce is not None:
@@ -261,6 +265,18 @@ class Standby(discord.Client):
                 log.info("local dropped the target — leaving %s", holding.name)
                 self._leaving.add(gid)
                 await guild.change_voice_state(channel=None)
+
+    async def _update_presence(self, lease: Lease) -> None:
+        # Only while local is down: it owns the presence otherwise, and resends
+        # it on startup, which replaces ours.
+        local_down = lease.state == "handoff" or not lease.fresh
+        if local_down and not self._sleeping:
+            log.info("local is down — status: %s", SLEEP_STATUS)
+            if not OBSERVE:
+                await self.change_presence(status=discord.Status.idle, activity=discord.CustomActivity(name=SLEEP_STATUS))
+        elif not local_down and self._sleeping:
+            log.info("local is back — leaving the status to it")
+        self._sleeping = local_down
 
     async def _join(self, guild: discord.Guild, channel_id: int) -> None:
         gid = guild.id

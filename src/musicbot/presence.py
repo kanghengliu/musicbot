@@ -112,7 +112,9 @@ def _to_activity(track: Track | None) -> discord.Activity | None:
 
 async def updater(bot: discord.Client) -> None:
     await bot.wait_until_ready()
-    last_name: str | None = None
+    # Sentinel so the first pass always sends: it replaces the cloud standby's
+    # "sleeping" status even when nothing is playing.
+    last_name: object = object()
     while not bot.is_closed():
         try:
             track = await asyncio.to_thread(_read_metadata)
