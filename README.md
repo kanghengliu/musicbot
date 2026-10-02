@@ -169,7 +169,7 @@ ssh vm 'cd ~/musicbot-standby && uv venv -p 3.12 .venv && uv pip install -p .ven
   && sudo loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now musicbot-standby'
 ```
 
-Then set `STANDBY_SSH_HOST=vm` in `.env` and restart the bot. The SSH key must work without an agent, because the systemd service has none. `STANDBY_OBSERVE=1` in the VM's `.env` makes the standby log what it would do without joining. On Oracle Linux, user-service logs go to the system journal: `sudo journalctl _SYSTEMD_USER_UNIT=musicbot-standby.service`.
+Then set `STANDBY_SSH_HOST=vm` in `.env` and restart the bot. The SSH key must work without an agent, because the systemd service has none. `STANDBY_OBSERVE=1` in the VM's `.env` makes the standby log what it would do without joining. If `journalctl --user` shows nothing on the VM (no persistent user journal), read the logs from the system journal: `sudo journalctl _SYSTEMD_USER_UNIT=musicbot-standby.service`.
 
 ## Troubleshooting
 
