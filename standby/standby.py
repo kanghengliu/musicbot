@@ -45,6 +45,9 @@ LEASE_FILE = STATE_DIR / "lease.json"
 
 STALE_AFTER = float(os.environ.get("STANDBY_STALE_SECONDS", "30"))
 ORPHAN_GRACE = 2.0
+# A reconnect request older than this is stale (e.g. it sat in a dead SSH
+# connection during an outage); the local bot only waits a few seconds.
+BOUNCE_MAX_AGE = 5.0
 # Custom status shown while the local bot is down (status goes idle too).
 SLEEP_STATUS = os.environ.get("STANDBY_STATUS", "💤 Sleeping")
 TICK = 0.25
@@ -197,6 +200,7 @@ class Standby(discord.Client):
         if after.session_id != mine and before.session_id == mine and before.channel is not None:
             log.info("local bot took the channel — standing down")
             self._displaced[gid] = lease.received_at
+            self._bounce_pending.discard(gid)
 
     async def _tick_loop(self) -> None:
         await self.wait_until_ready()
@@ -233,9 +237,18 @@ class Standby(discord.Client):
             if lease.received_at > at:
                 del self._displaced[gid]
         await self._update_presence(lease)
+        if self.is_closed():
+            return
         if lease.bounce != self._bounce_seen:
             self._bounce_seen = lease.bounce
-            if lease.fresh and lease.bounce is not None:
+            try:
+                age = time.time() - float(lease.bounce or 0)
+            except ValueError:
+                age = float("inf")
+            if age > BOUNCE_MAX_AGE:
+                if lease.bounce is not None:
+                    log.info("ignoring a reconnect request from %.0fs ago", age)
+            elif lease.fresh:
                 # Local is re-handshaking voice: hold the slot so Discord hands
                 # it a fresh voice server when it joins back.
                 for gid in lease.targets:
