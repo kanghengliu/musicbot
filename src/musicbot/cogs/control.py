@@ -302,6 +302,22 @@ async def _skip(interaction: discord.Interaction) -> None:
         )
 
 
+async def _toggle_pause(interaction: discord.Interaction) -> None:
+    """Pause or resume and announce it publicly. The interaction must already be deferred."""
+    try:
+        result = await applemusic.toggle_pause()
+    except Exception as exc:
+        log.warning("toggle_pause failed: %r", exc)
+        await interaction.followup.send(f"Couldn't control Apple Music in WayDroid: `{exc}`")
+        return
+    if not result.changed:
+        await interaction.followup.send(f"Apple Music didn't respond (state: {result.after.state}).")
+    elif result.after.state == "playing":
+        await interaction.followup.send(f"▶️ Resumed **{_now(result.after)}**")
+    else:
+        await interaction.followup.send(f"⏸️ Paused **{_now(result.after)}**")
+
+
 class SearchModal(discord.ui.Modal, title="Search Apple Music"):
     query = discord.ui.TextInput(label="Song title, artist, or both", max_length=100)
 
@@ -336,18 +352,18 @@ class QueueActions(discord.ui.View):
         else:
             await interaction.response.send_message(msg, ephemeral=True)
 
-    @discord.ui.button(label="Queue", emoji="🎵", style=discord.ButtonStyle.primary, custom_id="ecaqueue:queue")
+    @discord.ui.button(label="Add to queue", emoji="➕", style=discord.ButtonStyle.primary, custom_id="ecaqueue:queue")
     async def search(self, interaction: discord.Interaction, _button: discord.ui.Button):
         if await _deny_non_controllers(interaction):
             return
         await interaction.response.send_modal(SearchModal())
 
-    @discord.ui.button(label="Remove", emoji="🗑️", style=discord.ButtonStyle.secondary, custom_id="ecaqueue:remove")
-    async def remove(self, interaction: discord.Interaction, _button: discord.ui.Button):
+    @discord.ui.button(label="Pause/Resume", emoji="⏯️", style=discord.ButtonStyle.secondary, custom_id="ecaqueue:pause")
+    async def pause(self, interaction: discord.Interaction, _button: discord.ui.Button):
         if await _deny_non_controllers(interaction):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await _remove_prompt(interaction)
+        await interaction.response.defer(thinking=True)
+        await _toggle_pause(interaction)
 
     @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="ecaqueue:skip")
     async def skip(self, interaction: discord.Interaction, _button: discord.ui.Button):
@@ -448,18 +464,7 @@ class Control(commands.Cog):
     @controllers_only
     async def ecapause(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
-        try:
-            result = await applemusic.toggle_pause()
-        except Exception as exc:
-            log.warning("toggle_pause failed: %r", exc)
-            await interaction.followup.send(f"Couldn't control Apple Music in WayDroid: `{exc}`")
-            return
-        if not result.changed:
-            await interaction.followup.send(f"Apple Music didn't respond (state: {result.after.state}).")
-        elif result.after.state == "playing":
-            await interaction.followup.send(f"▶️ Resumed **{_now(result.after)}**")
-        else:
-            await interaction.followup.send(f"⏸️ Paused **{_now(result.after)}**")
+        await _toggle_pause(interaction)
 
 
 async def setup(bot: commands.Bot):
