@@ -23,7 +23,7 @@ CONTROL_ROLE_IDS = _id_set("CONTROL_ROLE_IDS")
 CONTROL_USER_IDS = _id_set("CONTROL_USER_IDS")
 # Songs /ecaqueue lists per section before collapsing the rest into "…and N more".
 _QUEUE_LIMIT = 20
-_AFTER_QUEUE_LIMIT = 5
+_AUTOPLAY_LIMIT = 5
 # Refresh button cooldown per message: starts here, doubles on quick repeat presses, capped.
 _REFRESH_MIN_S = 2.0
 _REFRESH_MAX_S = 60.0
@@ -60,15 +60,15 @@ def _render_queue(result: applemusic.ControlResult) -> str:
     upcoming = result.upcoming()
     # Apple Music's Playing Next section is the songs people added; call it the
     # queue, matching the Add to queue button. Everything after it (the rest of
-    # the album/playlist, then Autoplay) is Apple Music's doing, so it's one
-    # section rather than two app-specific names people don't recognise.
+    # the album/playlist, then Apple's own picks) is Apple Music's doing, so it's
+    # one Autoplay section with a note saying so, rather than two sections.
     # Each with how many songs to list, a note under the header, and whether to
     # show it when empty: the queue always shows, so people see where songs go.
     groups = [
         ("Queue", _QUEUE_LIMIT, [e for e in upcoming if e.in_queue_section], None, True),
         (
-            "After the queue",
-            _AFTER_QUEUE_LIMIT,
+            "Autoplay",
+            _AUTOPLAY_LIMIT,
             [e for e in upcoming if not e.in_queue_section],
             "-# Picked by Apple Music. Added songs always play before these.",
             False,
