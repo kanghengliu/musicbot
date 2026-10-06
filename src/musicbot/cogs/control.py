@@ -22,9 +22,8 @@ def _id_set(name: str) -> set[int]:
 CONTROL_ROLE_IDS = _id_set("CONTROL_ROLE_IDS")
 CONTROL_USER_IDS = _id_set("CONTROL_USER_IDS")
 # Songs /ecaqueue lists per section before collapsing the rest into "…and N more".
-_PLAYING_NEXT_LIMIT = 20
-_CONTINUE_PLAYING_LIMIT = 5
-_AUTOPLAY_LIMIT = 3
+_QUEUE_LIMIT = 20
+_AFTER_QUEUE_LIMIT = 5
 # Refresh button cooldown per message: starts here, doubles on quick repeat presses, capped.
 _REFRESH_MIN_S = 2.0
 _REFRESH_MAX_S = 60.0
@@ -59,28 +58,37 @@ def _song(song: applemusic.Song) -> str:
 def _render_queue(result: applemusic.ControlResult) -> str:
     lines = [f"**Now:** {_now(result.after)}"]
     upcoming = result.upcoming()
-    # Same grouping and names as Apple Music's own queue screen, in play order.
-    # Each with how many songs to list: people's own picks matter most.
+    # Apple Music's Playing Next section is the songs people added; call it the
+    # queue, matching the Add to queue button. Everything after it (the rest of
+    # the album/playlist, then Autoplay) is Apple Music's doing, so it's one
+    # section rather than two app-specific names people don't recognise.
+    # Each with how many songs to list, a note under the header, and whether to
+    # show it when empty: the queue always shows, so people see where songs go.
     groups = [
-        ("Playing Next", _PLAYING_NEXT_LIMIT, [e for e in upcoming if e.in_queue_section]),
+        ("Queue", _QUEUE_LIMIT, [e for e in upcoming if e.in_queue_section], None, True),
         (
-            "Continue Playing",
-            _CONTINUE_PLAYING_LIMIT,
-            [e for e in upcoming if not e.in_queue_section and not e.from_autoplay],
+            "After the queue",
+            _AFTER_QUEUE_LIMIT,
+            [e for e in upcoming if not e.in_queue_section],
+            "-# Picked by Apple Music. Added songs always play before these.",
+            False,
         ),
-        ("Autoplay", _AUTOPLAY_LIMIT, [e for e in upcoming if e.from_autoplay and not e.in_queue_section]),
     ]
-    footer = "-# Apple Music only exposes the next few songs for autoplay."
-    # A long playlist's Continue Playing section alone can blow past Discord's
-    # 2000-character message limit, so cap each section and the message as a whole.
-    budget = 2000 - len(footer) - 1
+    # A long playlist alone can blow past Discord's 2000-character message
+    # limit, so cap each section and the message as a whole.
+    budget = 2000
     n = 0
-    for i, (title, limit, entries) in enumerate(groups):
-        if not entries:
+    for i, (title, limit, entries, note, always) in enumerate(groups):
+        if not entries and not always:
             continue
         lines.append(f"**{title}:**")
-        # Room for this section's "…and N more" line plus a header and one for each later section.
-        reserve = 30 + 60 * sum(1 for _, _, later in groups[i + 1 :] if later)
+        if not entries:
+            lines.append("-# Empty — press **Add to queue** to pick a song.")
+            continue
+        if note:
+            lines.append(note)
+        # Room for this section's "…and N more" line, plus a header, note and a couple of songs per later section.
+        reserve = 30 + 300 * sum(1 for later in groups[i + 1 :] if later[2])
         shown = 0
         for entry in entries[:limit]:
             line = f"`{n + shown + 1:>2}.` {escape_markdown(entry.describe())}"
@@ -91,10 +99,6 @@ def _render_queue(result: applemusic.ControlResult) -> str:
         if shown < len(entries):
             lines.append(f"-# …and {len(entries) - shown} more")
         n += len(entries)
-    if n:
-        lines.append(footer)
-    else:
-        lines.append("Nothing queued after this song.")
     return "\n".join(lines)[:2000]
 
 
