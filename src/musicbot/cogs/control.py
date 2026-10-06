@@ -197,46 +197,6 @@ class SongActions(OwnerView):
             announcement = f"➕ {interaction.user.mention} queued **{_song(song)}** {where}"
         await interaction.followup.send(announcement, allowed_mentions=discord.AllowedMentions.none())
 
-class RemoveSelect(discord.ui.Select):
-    def __init__(self, entries: list[applemusic.QueueEntry]):
-        # Keyed by Apple's queue slot id, not song id: the same song can be queued twice.
-        self.entries = {str(entry.queue_id): entry for entry in entries}
-        options = [
-            discord.SelectOption(
-                label=_clip(f"{i}. {entry.title or entry.id}", 100),
-                description=_clip(entry.artist, 100) or None,
-                value=str(entry.queue_id),
-            )
-            for i, entry in enumerate(entries, 1)
-        ]
-        super().__init__(placeholder="Pick a song to remove", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        entry = self.entries[self.values[0]]
-        name = escape_markdown(entry.describe())
-        await interaction.response.edit_message(content=f"Removing **{name}**…", view=None)
-        try:
-            result = await applemusic.remove(entry.queue_id)
-        except Exception as exc:
-            log.warning("remove(%s) failed: %r", entry.queue_id, exc)
-            await interaction.edit_original_response(content=f"Couldn't control Apple Music in WayDroid: `{exc}`")
-            return
-        if not result.changed or any(e.queue_id == entry.queue_id for e in result.queue):
-            await interaction.edit_original_response(
-                content=f"Apple Music didn't remove **{name}**. It may have already played or been removed."
-            )
-            return
-        await interaction.edit_original_response(content=f"Removed **{name}**.")
-        await interaction.followup.send(
-            f"➖ {interaction.user.mention} removed **{name}** from the queue",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-class RemoveView(OwnerView):
-    def __init__(self, owner_id: int, entries: list[applemusic.QueueEntry]):
-        super().__init__(owner_id)
-        self.add_item(RemoveSelect(entries))
-
 
 async def _search(interaction: discord.Interaction, query: str) -> None:
     """Reply with a song picker. The interaction must already be deferred ephemerally."""
@@ -255,26 +215,6 @@ async def _search(interaction: discord.Interaction, query: str) -> None:
     await interaction.followup.send(
         f"Results for **{escape_markdown(query)}**:",
         view=SearchView(interaction.user.id, songs),
-        ephemeral=True,
-    )
-
-
-async def _remove_prompt(interaction: discord.Interaction) -> None:
-    """Reply with a Playing Next picker. The interaction must already be deferred ephemerally."""
-    try:
-        result = await applemusic.upcoming()
-    except Exception as exc:
-        log.warning("upcoming failed: %r", exc)
-        await interaction.followup.send(f"Couldn't read Apple Music's queue: `{exc}`", ephemeral=True)
-        return
-    # Only songs people added; the album/playlist and Autoplay stay untouched.
-    entries = [e for e in result.upcoming() if e.in_queue_section and e.queue_id != -1][:25]
-    if not entries:
-        await interaction.followup.send("Nothing in **Playing Next** to remove.", ephemeral=True)
-        return
-    await interaction.followup.send(
-        "Which song should come out of **Playing Next**?",
-        view=RemoveView(interaction.user.id, entries),
         ephemeral=True,
     )
 
@@ -447,12 +387,6 @@ class Control(commands.Cog):
             await interaction.followup.send(f"Couldn't read Apple Music's queue: `{exc}`")
             return
         await interaction.followup.send(_render_queue(result), view=self.queue_actions)
-
-    @app_commands.command(name="ecaremove", description="不想听这首🗑️")
-    @controllers_only
-    async def ecaremove(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await _remove_prompt(interaction)
 
     @app_commands.command(name="ecaskip", description="切歌⏭️")
     @controllers_only
