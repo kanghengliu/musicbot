@@ -142,17 +142,20 @@ class SongActions(OwnerView):
         super().__init__(owner_id)
         self.song = song
 
-    @discord.ui.button(label="Play now", emoji="▶️", style=discord.ButtonStyle.primary)
-    async def play_now(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        await self._run(interaction, None)
+    # Adding to the end of the queue is what people want almost every time, so it
+    # comes first and is the highlighted button. Cutting in line goes after it,
+    # and replacing the current song sits last, away from where the eye lands.
+    @discord.ui.button(label="Add to queue", emoji="➕", style=discord.ButtonStyle.primary)
+    async def add_to_queue(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._run(interaction, False)
 
-    @discord.ui.button(label="Play next", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Cut in line (play next)", emoji="⤴️", style=discord.ButtonStyle.secondary)
     async def play_next(self, interaction: discord.Interaction, _button: discord.ui.Button):
         await self._run(interaction, True)
 
-    @discord.ui.button(label="Add to queue", emoji="➕", style=discord.ButtonStyle.secondary)
-    async def add_to_queue(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        await self._run(interaction, False)
+    @discord.ui.button(label="Play now", emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def play_now(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._run(interaction, None)
 
     async def _run(self, interaction: discord.Interaction, next_up: bool | None):
         """next_up: None = play now (keeps Playing Next), True = front of Playing Next, False = its end."""
