@@ -13,7 +13,8 @@ BOT_SINK_NODE="${BOT_SINK_NODE:-BotSink}"
 
 # Prints "<sink-input index> <node id>" for Waydroid's stream.
 waydroid_stream() {
-    pactl -f json list sink-inputs | python3 -c '
+    # pactl warns on stderr about non-ASCII stream titles; harmless.
+    pactl -f json list sink-inputs 2>/dev/null | python3 -c '
 import json, sys
 for s in json.load(sys.stdin):
     if s["properties"].get("node.name") == sys.argv[1]:
@@ -22,12 +23,18 @@ for s in json.load(sys.stdin):
 ' "$WAYDROID_NODE"
 }
 
-# Nodes Waydroid's left channel is linked to, other than BotSink. pactl can't
+# Sinks Waydroid's left channel is linked to, other than BotSink. pactl can't
 # tell us this: it reports the bot's parallel link as the stream's sink.
+# Non-sink consumers (e.g. OBS app-audio capture) aren't local playback.
 local_outputs() {
-    pw-link -l | awk -v src="$WAYDROID_NODE:output_FL" -v bot="$BOT_SINK_NODE:" '
+    pw-link -l | awk -v src="$WAYDROID_NODE:output_FL" -v bot="$BOT_SINK_NODE" \
+        -v sinks="$(pactl list short sinks | cut -f2)" '
+        BEGIN { n = split(sinks, s, "\n"); for (i = 1; i <= n; i++) is_sink[s[i]] = 1 }
         !/^ / { in_block = ($0 == src); next }
-        in_block && /\|->/ && index($2, bot) != 1 { split($2, a, ":"); print a[1] }'
+        in_block && /\|->/ {
+            sub(/^ *\|-> /, ""); split($0, a, ":")
+            if (is_sink[a[1]] && a[1] != bot) print a[1]
+        }'
 }
 
 notify() {
@@ -46,7 +53,11 @@ fi
 
 case "$action" in
     on)
-        pactl move-sink-input "$idx" "$BOT_SINK_NODE"
+        # Not pactl move-sink-input: pactl already reports the stream on BotSink
+        # (the bot's parallel link), so the move is a no-op. Set the target
+        # directly; pulse sink indices are PipeWire object serials.
+        bot_serial="$(pactl list short sinks | awk -v n="$BOT_SINK_NODE" '$2 == n { print $1 }')"
+        pw-metadata "$node" target.object "$bot_serial" >/dev/null
         notify "Local audio muted — bot still streaming"
         ;;
     off)
