@@ -25,6 +25,8 @@ STATE_FILE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/stat
 HANDOFF_TIMEOUT = 10
 # How long a reconnect waits for the standby to hold the slot.
 BOUNCE_TIMEOUT = 3
+# How often the watchdog checks that a connected client is actually playing.
+WATCHDOG_INTERVAL = 30
 
 
 def _tracked_client(cog: "Voice") -> type[discord.VoiceClient]:
@@ -85,10 +87,13 @@ class Voice(commands.Cog):
         # gid -> monotonic time we asked the standby to hold the slot for a
         # reconnect; its voice updates are expected until ours come back.
         self._bouncing: dict[int, float] = {}
+        self._watchdog_task: asyncio.Task[None] | None = None
 
     def cog_unload(self) -> None:
         for task in self._rejoin_tasks.values():
             task.cancel()
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
 
     @staticmethod
     def _load_targets() -> dict[int, int]:
@@ -223,6 +228,7 @@ class Voice(commands.Cog):
         if self._started:
             return
         self._started = True
+        self._watchdog_task = asyncio.create_task(self._watchdog(), name="voice-watchdog")
         own = self.bot.ws.session_id if self.bot.ws is not None else None
         for guild in self.bot.guilds:
             state = guild.me.voice
@@ -237,6 +243,37 @@ class Voice(commands.Cog):
             self._set_target(guild.id, state.channel.id)
         for gid in list(self._target):
             self._schedule_rejoin(gid, first_delay=0)
+
+    async def _watchdog(self) -> None:
+        # The player has been seen to vanish without its after-callback ever
+        # restarting it, leaving us connected but silent. A guild must be idle
+        # on two checks in a row, so a restart already in flight on the
+        # player thread isn't raced.
+        idle: set[int] = set()
+        while True:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            for gid in list(self._target):
+                guild = self.bot.get_guild(gid)
+                vc = guild.voice_client if guild is not None else None
+                if (
+                    self._handing_off
+                    or not isinstance(vc, discord.VoiceClient)
+                    or not vc.is_connected()
+                    or vc.is_playing()
+                    or vc.is_paused()
+                ):
+                    idle.discard(gid)
+                    continue
+                if gid not in idle:
+                    idle.add(gid)
+                    continue
+                idle.discard(gid)
+                log.warning("watchdog: connected but not playing — restarting playback")
+                self._expect_stop.pop(gid, None)
+                try:
+                    self._play(vc, gid)
+                except Exception as exc:
+                    log.warning("watchdog: restart failed: %r", exc)
 
     def _schedule_rejoin(self, gid: int, first_delay: float | None = None) -> None:
         if self._handing_off:
