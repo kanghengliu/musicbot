@@ -13,6 +13,7 @@ import logging
 import os
 import signal
 import time
+from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
@@ -39,9 +40,14 @@ class StandbyLink:
         self.state = "alive"
         # Changes whenever we ask the standby to hold the slot for a reconnect.
         self.bounce_id: str | None = None
-        # Set once startup has adopted the channel we're in; until then a
-        # missing target must not read as "leave" to the standby.
-        self.final = False
+        # Guilds whose target was explicitly dropped (/ecaleave, kick, channel
+        # deleted): the only case the standby may leave a channel it holds. A
+        # target merely missing (startup, lost state) never means leave.
+        self.released: set[int] = set()
+        # () -> (gateway connection open, seconds since we last heard from
+        # Discord), so the standby can cover a dead gateway session before
+        # Discord drops it, even while this process and SSH are fine.
+        self.gateway_probe: Callable[[], tuple[bool, float]] | None = None
         self._last_ok = 0.0
         self._wake = asyncio.Event()
         self._proc: asyncio.subprocess.Process | None = None
@@ -69,8 +75,9 @@ class StandbyLink:
             except asyncio.TimeoutError:
                 proc.kill()
 
-    def set_targets(self, targets: dict[int, int]) -> None:
+    def set_targets(self, targets: dict[int, int], released: set[int] | None = None) -> None:
         self.targets = dict(targets)
+        self.released = (self.released | (released or set())) - set(targets)
         self._wake.set()
 
     @property
@@ -93,9 +100,11 @@ class StandbyLink:
             "state": self.state,
             "targets": {str(gid): str(cid) for gid, cid in self.targets.items()},
             "bounce": self.bounce_id,
-            "final": self.final,
+            "released": [str(gid) for gid in self.released],
             "sent_at": time.time(),
         }
+        if self.gateway_probe is not None:
+            payload["gateway_open"], payload["gateway_silent"] = self.gateway_probe()
         return (json.dumps(payload) + "\n").encode()
 
     async def _send(self) -> bool:

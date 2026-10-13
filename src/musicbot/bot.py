@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from datetime import datetime
 
 import discord
@@ -72,6 +73,14 @@ class MusicBot(commands.Bot):
         self._routing_task: asyncio.Task[None] | None = None
         self._presence_task: asyncio.Task[None] | None = None
         self.standby = StandbyLink.from_env()
+        # Whether we have a ready gateway session (READY or RESUMED seen since
+        # the last disconnect), and since when we haven't. discord.py fires
+        # on_disconnect on every failed reconnect attempt too, so only the
+        # first one after being up starts the clock.
+        self._gateway_up = False
+        self._gateway_down_since = time.monotonic()
+        if self.standby is not None:
+            self.standby.gateway_probe = self.gateway_health
 
     async def setup_hook(self) -> None:
         self._connection.parsers["VOICE_CHANNEL_START_TIME_UPDATE"] = log_voice_timer
@@ -101,13 +110,12 @@ class MusicBot(commands.Bot):
         voice = self.get_cog("Voice")
         if voice is not None:
             try:
-                handed_off = await voice.handoff()
+                await voice.handoff()
             except Exception:
                 log.exception("standby handoff failed")
-                handed_off = False
-            if not handed_off:
-                log.warning("closing without ending the session, so we stay in voice until the standby takes over")
-                keep_session_on_close(self)
+        # Always: our cache can't prove we don't hold the slot (a join may
+        # land late), and a session left idle just expires.
+        keep_session_on_close(self)
         if self.standby is not None:
             await self.standby.stop()
         for task in (self._routing_task, self._presence_task):
@@ -117,6 +125,27 @@ class MusicBot(commands.Bot):
 
     async def on_ready(self):
         log.info("logged in as %s (id=%s)", self.user, self.user.id if self.user else "?")
+
+    async def on_connect(self):
+        self._gateway_up = True
+
+    async def on_resumed(self):
+        self._gateway_up = True
+
+    async def on_disconnect(self):
+        if self._gateway_up:
+            self._gateway_up = False
+            self._gateway_down_since = time.monotonic()
+
+    def gateway_health(self) -> tuple[bool, float]:
+        """(connection open, seconds since Discord last sent us anything)."""
+        ws = self.ws
+        keep_alive = getattr(ws, "_keep_alive", None)
+        if self._gateway_up and ws is not None and ws.open and keep_alive is not None:
+            # Discord acks our heartbeat every ~41s, so this stays under that
+            # while the connection is alive, even in a quiet guild.
+            return True, max(0.0, time.perf_counter() - keep_alive._last_recv)
+        return False, time.monotonic() - self._gateway_down_since
 
 
 async def _amain() -> None:

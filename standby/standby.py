@@ -8,8 +8,12 @@ Two entry points:
   standby.py run     The standby itself (systemd service). Logs in with the same
                      bot token, watches the lease file and the bot's voice state.
 
-The standby only sends gateway voice-state updates (join/leave); it never opens
-an audio connection, so it can't fight the local bot's audio connection.
+The standby opens a real (silent, self-muted) audio connection when it takes
+the slot, so Discord shows it as connected rather than with a connection-trouble
+warning. Its voice client never sends a gateway leave and never reconnects on
+its own, and drops its audio side quietly as soon as another session (the local
+bot) takes the slot. If the audio handshake fails, it still holds the slot via
+its gateway voice state, as it did before it had audio.
 
 Rules, per guild with a target channel in the lease:
   - Lease fresh (local alive):   stay out. If we hold the channel, wait for the
@@ -37,6 +41,7 @@ from datetime import datetime
 from pathlib import Path
 
 import discord
+from discord.voice_state import ConnectionFlowState, VoiceConnectionState
 
 log = logging.getLogger("standby")
 
@@ -55,6 +60,12 @@ JOIN_ACK_TIMEOUT = 3.0
 # Minimum gap between such forced reconnects, in case Discord is ignoring the
 # join for some other reason.
 FORCED_RECONNECT_GAP = 20.0
+# Local's own Discord connection, as its lease reports it: take over when it
+# has been down this long, or silent this long while open (Discord acks a
+# heartbeat every ~41s, so a live one never gets there). Both leave margin
+# before Discord drops a dead session's voice state (~80s).
+GATEWAY_DOWN_AFTER = 15.0
+GATEWAY_SILENT_AFTER = 55.0
 # Custom status shown while the local bot is down (status goes idle too).
 SLEEP_STATUS = os.environ.get("STANDBY_STATUS", "💤 Sleeping")
 TICK = 0.25
@@ -86,13 +97,21 @@ class Lease:
         self.targets: dict[int, int] = {int(g): int(c) for g, c in (data.get("targets") or {}).items()}
         self.received_at: float = float(data.get("received_at", 0))
         self.bounce: str | None = data.get("bounce")
-        # False while local is still starting up and its targets may be
-        # incomplete: a missing target then isn't a request to leave.
-        self.final: bool = bool(data.get("final", False))
+        # Guilds local explicitly let go of (/ecaleave, kicked, channel
+        # deleted). A target merely missing never means leave.
+        self.released: set[int] = {int(g) for g in data.get("released") or ()}
+        self.gateway_open: bool = bool(data.get("gateway_open", True))
+        self.gateway_silent: float = float(data.get("gateway_silent", 0.0))
 
     @property
     def fresh(self) -> bool:
         return time.time() - self.received_at < STALE_AFTER
+
+    @property
+    def gateway_dead(self) -> bool:
+        # The silence kept growing since local reported it.
+        silent = self.gateway_silent + max(0.0, time.time() - self.received_at)
+        return silent >= (GATEWAY_SILENT_AFTER if self.gateway_open else GATEWAY_DOWN_AFTER)
 
     @classmethod
     def load(cls) -> "Lease":
@@ -132,6 +151,65 @@ def track_voice_sessions(client: discord.Client) -> None:
     parsers["VOICE_STATE_UPDATE"] = parse
 
 
+# How long an audio handshake may take after our join.
+VOICE_CONNECT_TIMEOUT = 20.0
+
+
+class HoldingConnectionState(VoiceConnectionState):
+    # Set only when local explicitly released the channel.
+    leaving = False
+    _joined = False
+
+    async def _voice_connect(self, *, self_deaf: bool = False, self_mute: bool = False) -> None:
+        # Only the join we asked for. discord.py also re-sends the gateway join
+        # on its own (resume after a 4015 close, a move mid-handshake) even
+        # with reconnect=False; that would take the slot back from the local
+        # bot. Failing as a timeout lands in its no-reconnect teardown.
+        if self._joined:
+            raise asyncio.TimeoutError("standby never re-joins on its own")
+        self._joined = True
+        await super()._voice_connect(self_deaf=self_deaf, self_mute=self_mute)
+
+    async def _voice_disconnect(self) -> None:
+        # discord.py sends a gateway leave when it tears down or gives up on a
+        # voice connection. The voice state is per bot, so that would also
+        # drop the local bot, or empty the channel if we're the holder.
+        if self.leaving:
+            await super()._voice_disconnect()
+            return
+        self.state = ConnectionFlowState.disconnected
+        self._disconnected.set()
+
+
+class HoldingVoiceClient(discord.VoiceClient):
+    def create_connection_state(self) -> VoiceConnectionState:
+        return HoldingConnectionState(self)
+
+    async def on_voice_state_update(self, data) -> None:
+        ws = self.client.ws
+        own = ws.session_id if ws is not None else None
+        if own is not None and data.get("session_id") not in (None, own):
+            # Another session (the local bot) took the slot. Drop our audio
+            # side without a leave, and keep discord.py from adopting the
+            # foreign session.
+            asyncio.create_task(drop_voice_client(self))
+            return
+        await super().on_voice_state_update(data)
+
+
+async def drop_voice_client(vc: discord.VoiceClient) -> None:
+    """Tear down our audio side without sending a gateway leave."""
+    conn = vc._connection
+    connector = conn._connector
+    if connector is not None and not connector.done() and connector is not asyncio.current_task():
+        connector.cancel()
+        await asyncio.wait([connector])
+    await conn.soft_disconnect(with_state=ConnectionFlowState.disconnected)
+    conn._socket_reader.stop()
+    if vc.guild.voice_client is vc:
+        vc.cleanup()
+
+
 class Standby(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.none()
@@ -157,6 +235,8 @@ class Standby(discord.Client):
         self._bounce_pending: set[int] = set()
         # gid -> monotonic time of a join Discord hasn't echoed back yet.
         self._join_sent: dict[int, float] = {}
+        # gid -> task running channel.connect() for our audio side.
+        self._voice_tasks: dict[int, asyncio.Task[None]] = {}
         self._forced_reconnect = -FORCED_RECONNECT_GAP
         self._sleeping = False
 
@@ -246,6 +326,8 @@ class Standby(discord.Client):
             return True, "local handed off"
         if gid in self._bounce_pending:
             return True, "local is reconnecting"
+        if lease.fresh and lease.gateway_dead:
+            return True, "local's Discord connection is down"
         if not lease.fresh and time.monotonic() - self._displaced.get(gid, -1e9) >= STALE_AFTER:
             return True, f"lease stale (>{STALE_AFTER:.0f}s)"
         orphaned = self._orphaned.get(gid)
@@ -256,7 +338,9 @@ class Standby(discord.Client):
     async def _tick(self) -> None:
         lease = Lease.load()
         for gid, at in list(self._kicked.items()):
-            if lease.fresh and lease.state == "alive" and lease.received_at > at:
+            # Only a genuinely healthy local clears it; a fresh lease alone
+            # doesn't, or the gateway-dead rule would rejoin after a kick.
+            if lease.fresh and lease.state == "alive" and not lease.gateway_dead and lease.received_at > at:
                 del self._kicked[gid]
         for gid, at in list(self._displaced.items()):
             if time.monotonic() - at >= STALE_AFTER:
@@ -300,9 +384,10 @@ class Standby(discord.Client):
                 self._bounce_pending.discard(gid)
             if want and target is not None and (holding is None or holding.id != target):
                 await self._join(guild, target)
-            elif not want and holding is not None and lease.fresh and lease.final and target is None:
+            elif not want and holding is not None and lease.fresh and target is None and gid in lease.released:
                 log.info("local dropped the target — leaving %s", holding.name)
                 self._leaving.add(gid)
+                await self._drop_voice(guild)
                 await guild.change_voice_state(channel=None)
 
     def _check_join_acks(self) -> None:
@@ -380,8 +465,39 @@ class Standby(discord.Client):
         self._next_attempt[gid] = now + min(10, 5 * 2**failures)
         self._failures[gid] = failures + 1
         log.info("joining %s", channel.name)
-        await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)
+        await self._drop_voice(guild)
         self._join_sent.setdefault(gid, now)
+        # The join itself goes out as part of the connect; run it aside so a
+        # slow handshake doesn't hold up the tick loop.
+        self._voice_tasks[gid] = asyncio.create_task(self._connect_voice(channel), name=f"standby-voice-{gid}")
+
+    async def _connect_voice(self, channel: discord.VoiceChannel) -> None:
+        try:
+            await channel.connect(
+                cls=HoldingVoiceClient, reconnect=False, timeout=VOICE_CONNECT_TIMEOUT,
+                self_mute=True, self_deaf=True,
+            )
+            log.info("audio connected in %s", channel.name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The join may still have landed: we hold the slot, just without
+            # audio (Discord shows the warning icon). Retrying would need a
+            # leave, since Discord ignores a join to the channel we're in.
+            log.warning("audio connect in %s failed: %r — holding without audio", channel.name, exc)
+        finally:
+            vc = channel.guild.voice_client
+            if isinstance(vc, discord.VoiceClient) and not vc.is_connected():
+                await drop_voice_client(vc)
+
+    async def _drop_voice(self, guild: discord.Guild) -> None:
+        task = self._voice_tasks.pop(guild.id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait([task])
+        vc = guild.voice_client
+        if isinstance(vc, discord.VoiceClient):
+            await drop_voice_client(vc)
 
 
 def main() -> None:

@@ -21,7 +21,10 @@ JOIN_TIMEOUT = 10
 
 
 class LocalBouncer:
-    def __init__(self, token: str, guild_id: int, channel_id: int, needed: Callable[[], bool]):
+    def __init__(
+        self, token: str, guild_id: int, channel_id: int,
+        needed: Callable[[], bool], on_session: Callable[[str], None],
+    ):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.voice_states = True
@@ -33,6 +36,9 @@ class LocalBouncer:
         # Checked before joining: the reconnect may have finished while we
         # logged in, and joining then would pull the slot from it.
         self.needed = needed
+        # Told our session id before we join, so the main bot can tell our
+        # voice updates from the standby's.
+        self.on_session = on_session
         self._task: asyncio.Task[None] | None = None
         self._join_sent = False
 
@@ -55,6 +61,8 @@ class LocalBouncer:
         channel = guild.get_channel(self.channel_id) if guild is not None else None
         if guild is None or not isinstance(channel, discord.VoiceChannel) or not self.needed():
             return False
+        if self.client.ws is not None and self.client.ws.session_id:
+            self.on_session(self.client.ws.session_id)
         self._join_sent = True
         await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)
         loop = asyncio.get_running_loop()
