@@ -46,8 +46,15 @@ LEASE_FILE = STATE_DIR / "lease.json"
 STALE_AFTER = float(os.environ.get("STANDBY_STALE_SECONDS", "30"))
 ORPHAN_GRACE = 2.0
 # A reconnect request older than this is stale (e.g. it sat in a dead SSH
-# connection during an outage); the local bot only waits a few seconds.
+# connection during an outage); the local bot re-sends it every few seconds
+# while it waits.
 BOUNCE_MAX_AGE = 5.0
+# A join Discord hasn't echoed back by now went into a dead gateway socket;
+# reconnect rather than wait out discord.py's ~60s heartbeat timeout.
+JOIN_ACK_TIMEOUT = 3.0
+# Minimum gap between such forced reconnects, in case Discord is ignoring the
+# join for some other reason.
+FORCED_RECONNECT_GAP = 60.0
 # Custom status shown while the local bot is down (status goes idle too).
 SLEEP_STATUS = os.environ.get("STANDBY_STATUS", "💤 Sleeping")
 TICK = 0.25
@@ -144,6 +151,9 @@ class Standby(discord.Client):
         # old request isn't replayed.
         self._bounce_seen: str | None = Lease.load().bounce
         self._bounce_pending: set[int] = set()
+        # gid -> monotonic time of a join Discord hasn't echoed back yet.
+        self._join_sent: dict[int, float] = {}
+        self._forced_reconnect = -FORCED_RECONNECT_GAP
         self._sleeping = False
 
     async def setup_hook(self) -> None:
@@ -170,6 +180,16 @@ class Standby(discord.Client):
             state = guild.me.voice
             if state is not None and state.channel is not None:
                 log.info("bot is in %s/%s under session %s", guild.name, state.channel.name, state.session_id)
+        self._retry_joins()
+
+    async def on_resumed(self) -> None:
+        self._retry_joins()
+
+    def _retry_joins(self) -> None:
+        # Joins sent before a reconnect may have been lost; send them again
+        # on the next tick rather than after their backoff.
+        self._join_sent.clear()
+        self._next_attempt.clear()
 
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if self.user is None or member.id != self.user.id:
@@ -194,6 +214,7 @@ class Standby(discord.Client):
             return
         self._orphaned.pop(gid, None)
         if after.session_id == mine:
+            self._join_sent.pop(gid, None)
             # Our join landed; a reconnect hold is served even if the local
             # bot takes the slot back before the next tick sees us holding it.
             self._bounce_pending.discard(gid)
@@ -239,6 +260,7 @@ class Standby(discord.Client):
         await self._update_presence(lease)
         if self.is_closed():
             return
+        self._check_join_acks()
         if lease.bounce != self._bounce_seen:
             self._bounce_seen = lease.bounce
             try:
@@ -279,6 +301,20 @@ class Standby(discord.Client):
                 self._leaving.add(gid)
                 await guild.change_voice_state(channel=None)
 
+    def _check_join_acks(self) -> None:
+        now = time.monotonic()
+        late = [gid for gid, at in self._join_sent.items() if now - at > JOIN_ACK_TIMEOUT]
+        if not late or self.ws is None:
+            return
+        self._join_sent.clear()
+        if now - self._forced_reconnect < FORCED_RECONNECT_GAP:
+            return
+        self._forced_reconnect = now
+        log.warning("join not acknowledged within %.0fs — gateway looks dead, reconnecting", JOIN_ACK_TIMEOUT)
+        # Same as discord.py's heartbeat timeout: close with 4000 and resume.
+        # In a task, since closing a dead socket can take a while.
+        asyncio.create_task(self.ws.close(4000))
+
     async def _update_presence(self, lease: Lease) -> None:
         # Only while local is down. Discord keeps showing a status this
         # session set even after the local bot sets its own, and changing it
@@ -311,6 +347,7 @@ class Standby(discord.Client):
         self._failures[gid] = failures + 1
         log.info("joining %s", channel.name)
         await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)
+        self._join_sent.setdefault(gid, now)
 
 
 def main() -> None:

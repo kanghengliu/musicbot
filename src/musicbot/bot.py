@@ -44,6 +44,25 @@ def track_voice_sessions(client: discord.Client) -> None:
     parsers["VOICE_STATE_UPDATE"] = parse
 
 
+def keep_session_on_close(client: discord.Client) -> None:
+    """Make the next close() end the gateway connection but not the session.
+
+    discord.py closes with 1000, which ends the session and with it the bot's
+    voice state, emptying the channel on the spot. Any other code leaves the
+    session resumable, so Discord keeps the bot in voice (as after a crash)
+    until another session takes the slot or the session times out.
+    """
+    ws = client.ws
+    if ws is None:
+        return
+    close = ws.close
+
+    async def close_resumable(code: int = 4000) -> None:
+        await close(4000)
+
+    ws.close = close_resumable  # type: ignore[method-assign]
+
+
 class MusicBot(commands.Bot):
     def __init__(self, guild_ids: list[int]):
         intents = discord.Intents.default()
@@ -82,9 +101,13 @@ class MusicBot(commands.Bot):
         voice = self.get_cog("Voice")
         if voice is not None:
             try:
-                await voice.handoff()
+                handed_off = await voice.handoff()
             except Exception:
                 log.exception("standby handoff failed")
+                handed_off = False
+            if not handed_off:
+                log.warning("closing without ending the session, so we stay in voice until the standby takes over")
+                keep_session_on_close(self)
         if self.standby is not None:
             await self.standby.stop()
         for task in (self._routing_task, self._presence_task):
