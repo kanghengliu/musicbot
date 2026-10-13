@@ -143,15 +143,17 @@ Muting WayDroid's stream volume would silence the bot too, since stream volume a
 
 ### Cloud standby
 
-`standby/standby.py` runs on an always-on VM and keeps the bot sitting in its voice channel while this machine is off or offline, so the channel never empties and its "active for" timer doesn't reset. It logs in with the same bot token but only joins and leaves. It plays no audio and ignores commands.
+`standby/standby.py` runs on an always-on VM and keeps the bot sitting in its voice channel while this machine is off or offline, so the channel never empties and its "active for" timer doesn't reset. It logs in with the same bot token and ignores commands. When it takes the slot, it opens a silent, self-muted audio connection, so Discord shows it as connected rather than with a connection warning. If that handshake fails, it still holds the slot without audio.
 
 The local bot keeps one `ssh $STANDBY_SSH_HOST` session open and sends a heartbeat with its target channel every 10s. The standby:
 
-- **Holds the channel** if heartbeats stop for 30s. Discord removes a dead session from voice about 80s after it goes silent; measured 2026-10-02. When the standby joins, it takes the slot over before the channel can empty.
+- **Holds the channel** if heartbeats stop for 30s, or if they report that the local bot's own Discord connection has been down for 15s (or silent for 55s). Discord removes a dead session from voice about 80s after it goes silent; measured 2026-10-02. When the standby joins, it takes the slot over before the channel can empty.
 - **Joins immediately** when the local bot shuts down cleanly (service stop, reboot). The local bot waits up to 10s for the standby to appear, then exits without leaving voice.
-- **Holds the slot during voice reconnects.** discord.py reconnects by leaving and rejoining, which empties the channel for a moment and resets the timer. Re-sending a join for the channel the bot is already in gets no reply from Discord. So the local bot never sends that leave. It asks the standby to take the slot (about 50ms), then joins back. The change of session makes Discord send a fresh voice server. Without a reachable standby, it falls back to leaving and rejoining.
-- **Steps aside** when the local bot comes back. The local bot takes the channel on startup or rejoin, and Discord moves the voice session to it.
-- **Stays out** after `/ecaleave`, or when a mod disconnects the bot, until the local bot is heard from again.
+- **Holds the slot during voice reconnects.** discord.py reconnects by leaving and rejoining, which empties the channel for a moment and resets the timer. Re-sending a join for the channel the bot is already in gets no reply from Discord. So the local bot never sends that leave. It asks the standby to take the slot (about 50ms), then joins back. The change of session makes Discord send a fresh voice server. If the standby hasn't taken the slot within 5s, a second login of the bot on this machine takes it instead. The bot never leaves to reconnect, however long that takes.
+- **Steps aside** when the local bot comes back. The local bot takes the channel on startup or rejoin, and Discord moves the voice session to it. If the SSH link is down, the local bot leaves the slot with the standby until the link is back, instead of trading it back and forth.
+- **Leaves** only when the local bot explicitly releases the channel: `/ecaleave` (owner only), a mod disconnecting the bot, or the channel being deleted. After a mod disconnects it, it stays out until the local bot is healthy again.
+
+Every shutdown on both sides closes the Discord session resumably, never with the normal close that would drop the bot from voice at once.
 
 The target channel is saved in `~/.local/state/musicbot/voice.json`, so the local bot rejoins after restarts on its own.
 
@@ -164,7 +166,7 @@ ssh vm 'mkdir -p ~/musicbot-standby ~/.config/systemd/user'
 scp standby/standby.py vm:musicbot-standby/
 scp standby/musicbot-standby.service vm:.config/systemd/user/
 grep '^DISCORD_TOKEN=' .env | ssh vm 'umask 077; cat > ~/musicbot-standby/.env'
-ssh vm 'cd ~/musicbot-standby && uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "discord.py==2.7.1" \
+ssh vm 'cd ~/musicbot-standby && uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "discord.py==2.7.1" "PyNaCl==1.5.0" "davey==0.1.5" \
   && sudo loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now musicbot-standby'
 ```
 
