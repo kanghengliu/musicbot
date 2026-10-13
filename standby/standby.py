@@ -54,7 +54,7 @@ BOUNCE_MAX_AGE = 5.0
 JOIN_ACK_TIMEOUT = 3.0
 # Minimum gap between such forced reconnects, in case Discord is ignoring the
 # join for some other reason.
-FORCED_RECONNECT_GAP = 60.0
+FORCED_RECONNECT_GAP = 20.0
 # Custom status shown while the local bot is down (status goes idle too).
 SLEEP_STATUS = os.environ.get("STANDBY_STATUS", "💤 Sleeping")
 TICK = 0.25
@@ -86,6 +86,9 @@ class Lease:
         self.targets: dict[int, int] = {int(g): int(c) for g, c in (data.get("targets") or {}).items()}
         self.received_at: float = float(data.get("received_at", 0))
         self.bounce: str | None = data.get("bounce")
+        # False while local is still starting up and its targets may be
+        # incomplete: a missing target then isn't a request to leave.
+        self.final: bool = bool(data.get("final", False))
 
     @property
     def fresh(self) -> bool:
@@ -138,8 +141,9 @@ class Standby(discord.Client):
         # gid -> lease.received_at when we were kicked; cleared once the local
         # bot is heard from again.
         self._kicked: dict[int, float] = {}
-        # gid -> lease.received_at when the local bot took the channel from us.
-        # Proof it's alive even if its lease is stale (e.g. SSH path broken).
+        # gid -> monotonic time the local bot took the channel from us. Proof
+        # it's alive even if its lease is stale (e.g. SSH path broken), but
+        # only for STALE_AFTER: it says nothing about whether local died since.
         self._displaced: dict[int, float] = {}
         # gid -> monotonic time the bot left voice under the local's session.
         self._orphaned: dict[int, float] = {}
@@ -220,7 +224,7 @@ class Standby(discord.Client):
             self._bounce_pending.discard(gid)
         if after.session_id != mine and before.session_id == mine and before.channel is not None:
             log.info("local bot took the channel — standing down")
-            self._displaced[gid] = lease.received_at
+            self._displaced[gid] = time.monotonic()
             self._bounce_pending.discard(gid)
 
     async def _tick_loop(self) -> None:
@@ -242,7 +246,7 @@ class Standby(discord.Client):
             return True, "local handed off"
         if gid in self._bounce_pending:
             return True, "local is reconnecting"
-        if not lease.fresh and gid not in self._displaced:
+        if not lease.fresh and time.monotonic() - self._displaced.get(gid, -1e9) >= STALE_AFTER:
             return True, f"lease stale (>{STALE_AFTER:.0f}s)"
         orphaned = self._orphaned.get(gid)
         if orphaned is not None and time.monotonic() - orphaned >= ORPHAN_GRACE:
@@ -255,7 +259,7 @@ class Standby(discord.Client):
             if lease.fresh and lease.state == "alive" and lease.received_at > at:
                 del self._kicked[gid]
         for gid, at in list(self._displaced.items()):
-            if lease.received_at > at:
+            if time.monotonic() - at >= STALE_AFTER:
                 del self._displaced[gid]
         await self._update_presence(lease)
         if self.is_closed():
@@ -296,7 +300,7 @@ class Standby(discord.Client):
                 self._bounce_pending.discard(gid)
             if want and target is not None and (holding is None or holding.id != target):
                 await self._join(guild, target)
-            elif not want and holding is not None and lease.fresh and target is None:
+            elif not want and holding is not None and lease.fresh and lease.final and target is None:
                 log.info("local dropped the target — leaving %s", holding.name)
                 self._leaving.add(gid)
                 await guild.change_voice_state(channel=None)
@@ -328,9 +332,37 @@ class Standby(discord.Client):
                 if not OBSERVE:
                     await self.change_presence(status=discord.Status.idle, activity=discord.CustomActivity(name=SLEEP_STATUS))
                 self._sleeping = True
-        elif self._sleeping and not any(self._holding(g) for g in self.guilds):
+        elif self._sleeping and self._local_holds_all(lease):
             log.info("local is back and holds the channel — restarting to drop our status")
             await self.close()
+
+    def _local_holds_all(self, lease: Lease) -> bool:
+        # Positively: another session in each target channel, and no join of
+        # ours in flight that could still land and leave us holding it.
+        if self._join_sent or self._bounce_pending:
+            return False
+        for gid, channel_id in lease.targets.items():
+            guild = self.get_guild(gid)
+            state = guild.me.voice if guild is not None else None
+            if state is None or state.channel is None or state.channel.id != channel_id or state.session_id == self._session:
+                return False
+        return True
+
+    async def close(self) -> None:
+        # discord.py closes with 1000, which ends the session and drops its
+        # voice state on the spot. Our cache can't prove we don't hold the
+        # slot (a join may have landed unechoed), so always close resumably:
+        # Discord keeps any voice state like after a crash until local takes
+        # it or our next login does, and an idle session just expires.
+        ws = self.ws
+        if ws is not None:
+            close = ws.close
+
+            async def close_resumable(code: int = 4000) -> None:
+                await close(4000)
+
+            ws.close = close_resumable  # type: ignore[method-assign]
+        await super().close()
 
     async def _join(self, guild: discord.Guild, channel_id: int) -> None:
         gid = guild.id
@@ -343,7 +375,9 @@ class Standby(discord.Client):
             self._next_attempt[gid] = now + 60
             return
         failures = self._failures.get(gid, 0)
-        self._next_attempt[gid] = now + min(60, 5 * 2**failures)
+        # Capped well under the ~80s a dead holder lingers before Discord
+        # drops it.
+        self._next_attempt[gid] = now + min(10, 5 * 2**failures)
         self._failures[gid] = failures + 1
         log.info("joining %s", channel.name)
         await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)

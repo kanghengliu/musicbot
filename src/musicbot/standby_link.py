@@ -39,6 +39,9 @@ class StandbyLink:
         self.state = "alive"
         # Changes whenever we ask the standby to hold the slot for a reconnect.
         self.bounce_id: str | None = None
+        # Set once startup has adopted the channel we're in; until then a
+        # missing target must not read as "leave" to the standby.
+        self.final = False
         self._last_ok = 0.0
         self._wake = asyncio.Event()
         self._proc: asyncio.subprocess.Process | None = None
@@ -90,6 +93,7 @@ class StandbyLink:
             "state": self.state,
             "targets": {str(gid): str(cid) for gid, cid in self.targets.items()},
             "bounce": self.bounce_id,
+            "final": self.final,
             "sent_at": time.time(),
         }
         return (json.dumps(payload) + "\n").encode()
@@ -103,6 +107,9 @@ class StandbyLink:
             await asyncio.wait_for(proc.stdin.drain(), timeout=5)
         except (OSError, asyncio.TimeoutError) as exc:
             log.warning("standby link: write failed: %r", exc)
+            # A stuck ssh would otherwise keep _run waiting on it forever.
+            if proc.returncode is None:
+                proc.kill()
             return False
         self._last_ok = time.monotonic()
         return True

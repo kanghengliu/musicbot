@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import weakref
 from pathlib import Path
 
 import discord
@@ -56,15 +57,35 @@ def _tracked_client(cog: "Voice") -> type[discord.VoiceClient]:
             # so the retry never gets a voice server. Instead the standby (or a
             # local bouncer) takes the slot, and our retry's join moves it back
             # with a fresh server.
-            if not self.leaving and await cog._hold_slot_for_reconnect(self.voice_client.guild):
+            vc = self.voice_client
+            if vc.guild.voice_client is not vc and not self.leaving:
+                # Orphaned by a new gateway session (READY wipes discord.py's
+                # voice clients); the new session's own client holds the slot.
+                # Never leave, and end this stale connection's retry loop and
+                # its player (whose ffmpeg would otherwise linger).
+                # Disconnected first, so its after-callback doesn't restart it.
+                self.state = ConnectionFlowState.disconnected
+                vc.stop()
+                raise asyncio.CancelledError
+            if not self.leaving and await cog._hold_slot_for_reconnect(vc.guild):
                 self.state = ConnectionFlowState.disconnected
                 self._disconnected.set()
                 return
             await super()._voice_disconnect()
 
     class TrackedVoiceClient(discord.VoiceClient):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            cog._clients.add(self)
+
         def create_connection_state(self) -> VoiceConnectionState:
             return GuardedConnectionState(self)
+
+        def cleanup(self) -> None:
+            # discord.py unregisters by guild id; an orphaned client (see
+            # _retire_orphans) must not remove its replacement.
+            if self.guild.voice_client in (self, None):
+                super().cleanup()
 
         async def on_voice_state_update(self, data) -> None:
             # Runs before discord.py's own handler, so we see its
@@ -98,6 +119,8 @@ class Voice(commands.Cog):
         self._bouncing: dict[int, float] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._bouncers: dict[int, asyncio.Task[None]] = {}
+        # Every voice client we've made, to find ones orphaned by a new session.
+        self._clients: "weakref.WeakSet[discord.VoiceClient]" = weakref.WeakSet()
         # Guilds whose reconnect is waiting for another session to hold the slot.
         self._awaiting_hold: set[int] = set()
 
@@ -275,8 +298,13 @@ class Voice(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        # on_ready repeats after full reconnects; startup adoption runs once.
+        # on_ready repeats after full reconnects (a new session), which also
+        # wipes discord.py's voice clients: rejoin every target each time so
+        # the new session takes the slot before the old one expires.
         if self._started:
+            await self._retire_orphans()
+            for gid in list(self._target):
+                self._schedule_rejoin(gid, first_delay=0)
             return
         self._started = True
         self._watchdog_task = asyncio.create_task(self._watchdog(), name="voice-watchdog")
@@ -294,6 +322,26 @@ class Voice(commands.Cog):
             self._set_target(guild.id, state.channel.id)
         for gid in list(self._target):
             self._schedule_rejoin(gid, first_delay=0)
+        if self._link is not None:
+            self._link.final = True
+            self._link.set_targets(self._target)
+
+    async def _retire_orphans(self) -> None:
+        # Clients discord.py dropped from its registry on READY still run
+        # their voice connection and retry loop. Stop them without a leave
+        # (the new session's join takes the slot) and without cleanup().
+        for vc in list(self._clients):
+            if vc.guild.voice_client is vc:
+                continue
+            conn = vc._connection
+            if conn.state is ConnectionFlowState.disconnected and conn._runner is None:
+                continue
+            log.info("retiring voice client orphaned by the new gateway session")
+            conn.state = ConnectionFlowState.disconnected
+            vc.stop()
+            await conn.soft_disconnect(with_state=ConnectionFlowState.disconnected)
+            # soft_disconnect only pauses the reader thread; this one's done.
+            conn._socket_reader.stop()
 
     async def _watchdog(self) -> None:
         # The player has been seen to vanish without its after-callback ever
@@ -306,6 +354,14 @@ class Voice(commands.Cog):
             for gid in list(self._target):
                 guild = self.bot.get_guild(gid)
                 vc = guild.voice_client if guild is not None else None
+                if (
+                    not self._handing_off
+                    and not isinstance(vc, discord.VoiceClient)
+                    and gid not in self._awaiting_hold
+                ):
+                    # No voice client at all and no rejoin under way (e.g. a
+                    # task died): get one going so we don't drift out.
+                    self._schedule_rejoin(gid, first_delay=0)
                 if (
                     self._handing_off
                     or not isinstance(vc, discord.VoiceClient)
@@ -395,7 +451,7 @@ class Voice(commands.Cog):
         one holding the slot, so closing must not end it.
         """
         clients = [vc for vc in self.bot.voice_clients if isinstance(vc, discord.VoiceClient)]
-        if self._link is None or not self._target:
+        if not self._target:
             return True
         self._handing_off = True
         for gid in list(self._rejoin_tasks):
@@ -404,6 +460,8 @@ class Voice(commands.Cog):
             self._expect_stop[vc.guild.id] = True
             vc.stop()
             await self._drop_client(vc)
+        if self._link is None:
+            return not any(self._we_hold(gid) for gid in self._target)
         if not await self._link.handoff():
             log.warning("handoff: standby link is down; leaving the voice state for it to take over")
             return False
@@ -470,6 +528,18 @@ class Voice(commands.Cog):
         target = await self._resolve_channel(interaction, channel)
         if target is None:
             return
+        # Moving away empties the channel we're in and resets its timer. The
+        # saved target covers a join whose voice state hasn't shown up yet.
+        current = interaction.guild.me.voice
+        here = {self._target.get(interaction.guild.id)}
+        if current is not None and current.channel is not None:
+            here.add(current.channel.id)
+        here.discard(None)
+        if (here - {target.id}) and not await self.bot.is_owner(interaction.user):
+            await interaction.response.send_message(
+                "I'm staying where I am — only the bot owner can move me.", ephemeral=True
+            )
+            return
 
         await interaction.response.defer(thinking=True)
 
@@ -496,6 +566,10 @@ class Voice(commands.Cog):
     async def ecaleave(self, interaction: discord.Interaction):
         if interaction.guild is None:
             await interaction.response.send_message("Guild-only command.", ephemeral=True)
+            return
+        if not await self.bot.is_owner(interaction.user):
+            # Leaving empties the channel and resets its timer.
+            await interaction.response.send_message("Only the bot owner can make me leave.", ephemeral=True)
             return
         gid = interaction.guild.id
         task = self._rejoin_tasks.get(gid)

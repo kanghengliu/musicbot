@@ -34,6 +34,7 @@ class LocalBouncer:
         # logged in, and joining then would pull the slot from it.
         self.needed = needed
         self._task: asyncio.Task[None] | None = None
+        self._join_sent = False
 
     @property
     def holding(self) -> bool:
@@ -54,6 +55,7 @@ class LocalBouncer:
         channel = guild.get_channel(self.channel_id) if guild is not None else None
         if guild is None or not isinstance(channel, discord.VoiceChannel) or not self.needed():
             return False
+        self._join_sent = True
         await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + JOIN_TIMEOUT
@@ -62,9 +64,11 @@ class LocalBouncer:
         return self.holding
 
     async def close(self) -> None:
-        if self.holding:
-            # Still the only one in the slot (e.g. we're shutting down): don't
-            # let our close empty the channel.
+        if self._join_sent:
+            # Our cache can lag Discord (a join accepted but not yet echoed),
+            # so never trust "not holding" here: a 1000 close while holding
+            # would empty the channel. A resumable close just leaves an idle
+            # session to expire.
             keep_session_on_close(self.client)
         await self.client.close()
         if self._task is not None:
