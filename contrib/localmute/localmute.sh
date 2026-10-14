@@ -5,11 +5,16 @@
 # headphones. The bot's BotSink link is untouched. "off" clears the target so
 # the stream follows your default output again.
 #
+# Also sets the Waydroid player to ignored in mprisence's config while muted, so
+# Discord drops that rich presence; mprisence hot-reloads the file.
+#
 # Usage: localmute.sh [on|off|toggle|status]   (default: toggle)
 set -euo pipefail
 
 WAYDROID_NODE="${WAYDROID_NODE:-Waydroid}"
 BOT_SINK_NODE="${BOT_SINK_NODE:-BotSink}"
+MPRISENCE_CONFIG="${MPRISENCE_CONFIG:-$HOME/.config/mprisence/config.toml}"
+MPRISENCE_PLAYER="${MPRISENCE_PLAYER:-apple_music_waydroid}"
 
 # Prints "<sink-input index> <node id>" for Waydroid's stream.
 waydroid_stream() {
@@ -37,6 +42,12 @@ local_outputs() {
         }'
 }
 
+# Sets `ignore` in the player's [player.<name>] table of mprisence's config.
+mprisence_ignore() {
+    sed -i "/^\[player\.$MPRISENCE_PLAYER\]/,/^\[/ s/^ignore = .*/ignore = $1/" \
+        "$MPRISENCE_CONFIG" || true
+}
+
 notify() {
     echo "$1"
     command -v notify-send >/dev/null && notify-send -a musicbot -t 1500 "$1" || true
@@ -58,6 +69,7 @@ case "$action" in
         # directly; pulse sink indices are PipeWire object serials.
         bot_serial="$(pactl list short sinks | awk -v n="$BOT_SINK_NODE" '$2 == n { print $1 }')"
         pw-metadata "$node" target.object "$bot_serial" >/dev/null
+        mprisence_ignore true
         notify "Local audio muted — bot still streaming"
         ;;
     off)
@@ -68,6 +80,7 @@ case "$action" in
         if [[ -z "$(local_outputs)" ]]; then
             pactl move-sink-input "$idx" @DEFAULT_SINK@
         fi
+        mprisence_ignore false
         notify "Local audio on"
         ;;
     status)
